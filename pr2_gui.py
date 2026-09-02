@@ -6,7 +6,7 @@ PR 柱子自动识别与测量工具 —— 单文件版（GUI）
   · 直接运行：python pr2_gui.py
   · 打包单 exe：PyInstaller --onefile --windowed pr2_gui.py
 
-布局：左=参数 | 中=原始图(框选/直线量测)+识别涂色图 | 右=统计分析表 | 底部=进度行
+布局：左=参数 | 中=原始图(框选/直线量测/角度量测)+识别涂色图 | 右=统计分析表 | 底部=进度行
 生成文件命名：工具自动整图=_tool；用户框选套索=_user。
 """
 import os
@@ -14,6 +14,7 @@ import sys
 import glob
 import math
 import queue
+import shutil
 import threading
 import traceback
 import contextlib
@@ -22,6 +23,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
 import cv2
+from typing import Any
 
 # ====================================================================
 # 分析核心（原 pr2_analysis.py，已并入本文件）
@@ -35,6 +37,7 @@ OUTPUT_SUBDIR = True                                     # True: 每张图建立
 
 # --- 二值化与边缘 ---
 THRESHOLD = 150    # 二值化阈值：灰度 > THRESHOLD 视为亮（柱子区域）。若固定阈值结果异常（全黑/全白），自动改用 Otsu
+THRESHOLD_TOL = 0  # 灰度容差：允许灰度略低于 THRESHOLD 的像素也被选入柱子区域，满足“灰度值大于或接近阈值”
 EDGE_MARGIN = 20   # 忽略图像四边边缘像素数：将四边置黑，避免图像边框/标尺线干扰识别
 MORPH_CLOSE_K = 3  # 闭运算核大小（应为奇数）：填充柱体内部小孔/毛刺；柱间窄谷宽度 > 核大小，不受影响
 DEBUG_OUTPUT = False  # True 时额外保存二值化中间结果图，便于批量调试阈值
@@ -96,12 +99,13 @@ def preprocess_image(image_path):
     img_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)  # 统一 8bit BGR，供绘图使用
 
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, binary = cv2.threshold(blur, THRESHOLD, 255, cv2.THRESH_BINARY)
+    lower = max(0, THRESHOLD - THRESHOLD_TOL)
+    _, binary = cv2.threshold(blur, lower, 255, cv2.THRESH_BINARY)
     bright_frac = binary.mean() / 255.0
     # 固定阈值失效保护：亮像素占比过低/过高说明阈值不适配当前图像，自动改用 Otsu
     if bright_frac < 0.01 or bright_frac > 0.9:
         _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        print(f"[warn] 固定阈值(THRESHOLD={THRESHOLD})结果异常(亮像素占比={bright_frac:.2%})，已自动改用 Otsu")
+        print(f"[warn] 固定阈值(THRESHOLD={THRESHOLD}, TOL={THRESHOLD_TOL})结果异常(亮像素占比={bright_frac:.2%})，已自动改用 Otsu")
     # 闭运算：填充柱体内部小孔/边缘毛刺
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((MORPH_CLOSE_K, MORPH_CLOSE_K), np.uint8))
     # 忽略四边边缘信息：避免图像边框/标尺线干扰
@@ -714,12 +718,12 @@ def analyze_pr_column(rows):
       angle_l_top/mid/bot, angle_r_top/mid/bot, ler_left, ler_right
     数值单位为 nm（角度为 °），无法计算时取 None。
     """
-    out = {k: None for k in (
-        'height', 'cd_top', 'cd_mid', 'cd_bot',
-        'ratio_tm', 'ratio_td', 'ratio_md',
-        'angle_l_top', 'angle_l_mid', 'angle_l_bot',
-        'angle_r_top', 'angle_r_mid', 'angle_r_bot',
-        'ler_left', 'ler_right')}
+    keys = ('height', 'cd_top', 'cd_mid', 'cd_bot',
+            'ratio_tm', 'ratio_td', 'ratio_md',
+            'angle_l_top', 'angle_l_mid', 'angle_l_bot',
+            'angle_r_top', 'angle_r_mid', 'angle_r_bot',
+            'ler_left', 'ler_right')
+    out: dict[str, Any] = {k: None for k in keys}   # 各键随后被填入数值/角度，用 Any 放宽类型
     if not rows:
         return out
     step = _row_step(rows)
@@ -1125,6 +1129,7 @@ core = sys.modules[__name__]
 # ---------------------------------------------------------------------------
 MAIN_PARAMS = [
     ("THRESHOLD",       "二值化阈值",     "int",   0,   255,   1),
+    ("THRESHOLD_TOL",   "灰度容差",       "int",   0,   50,    1),
     ("MORPH_CLOSE_K",   "闭运算核(奇)",   "int",   1,   101,   2),
     ("SMOOTH_KERNEL",   "投影平滑核(奇)", "int",   1,   101,   2),
     ("VALLEY_RATIO",    "谷值比例",       "float", 0.0, 1.0,   0.05),
@@ -1136,37 +1141,46 @@ MAIN_PARAMS = [
     ("WINDOW_MARGIN",   "扫描窗口外扩(px)", "int",  0,   20,    1),
 ]
 
-# 每个参数的详细说明（帮助 → 参数说明）
+# 每个参数的详细说明（帮助 → 参数说明，尽量口语化 + 给调参建议）
 PARAM_DESC = {
-    "THRESHOLD": "二值化阈值：灰度 > 该值的像素视为“亮”（柱子区域）。调低更容易把亮度偏暗的柱子纳入，"
-                 "调高可滤掉偏暗噪声。若整图亮像素占比异常（<1% 或 >90%）会自动改用 Otsu 自适应阈值。",
-    "MORPH_CLOSE_K": "闭运算核大小（自动取奇）：先膨胀再腐蚀，填补柱体内部小孔/毛刺。核需小于柱间谷宽，"
-                     "否则会把相邻柱子粘连。柱体越宽可适度调大。",
-    "SMOOTH_KERNEL": "投影平滑核大小（自动取奇）：对 x=n 列投影 / y=n 行投影做高斯平滑，越大曲线越光滑、"
-                     "谷值越少（可避免把一根柱子中间的小凹槽误切，但过大可能把小柱与邻居并在一起）。",
-    "VALLEY_RATIO": "谷值比例：列投影中低于“最高峰 × 该比例”的区域视为分隔柱子的谷槽。值越大，切分越激进"
-                    "（谷判定越宽松），值越小越保守。",
-    "MIN_COLUMN_HEIGHT": "最小柱高(px)：柱子轮廓高度低于该值判为噪声丢弃。",
-    "MIN_AVG_WIDTH": "最小平均宽(px)：柱子各行宽度平均值低于该值判为文字/窄条噪声丢弃。",
-    "MIN_ASPECT_RATIO": "最小高宽比：高度 < 平均宽度 × 该值 的扁宽亮块（基底亮斑等）判为噪声丢弃。",
-    "BOTTOM_OFFSET": "底部延伸(px)：识别出的底部再向下延伸几像素，覆盖基座边缘的毛刺，让底边更整齐。",
-    "EDGE_MARGIN": "边缘忽略(px)：把图像四边各裁掉该宽度并置黑，避免图像边框/标尺线参与识别。",
-    "WINDOW_MARGIN": "扫描窗口外扩(px)：逐行连通扫描时，允许当前行亮段相对上一行左右扩展的余量，"
-                     "用于跟随柱壁轻微抖动。",
-    "SCALE_PIXELS": "比例尺像素数：图像上已知实际长度所对应的像素总长度（如标尺 50 nm 对应 100 px 则填 100）。",
-    "SCALE_NM": "实际长度(nm)：上述比例尺对应的真实物理长度。换算系数 = SCALE_NM / SCALE_PIXELS。",
-    "OUTPUT_SUBDIR": "输出到“同名子文件夹”：为每张 tif 建立同名文件夹存放结果；关闭时全部输出到图像文件夹根目录。",
-    "DEBUG_OUTPUT": "调试模式：额外保存一张二值化中间图（*_debug_binary.png），便于观察阈值是否合适。",
+    "THRESHOLD": "【柱子有多亮才算“柱子”？】程序把图像看成黑白：灰度高于该值的像素当成柱子材料，"
+                 "低于的当成背景。调到偏暗柱不完整 → 调低；四周亮噪声一大片 → 调高。"
+                 "正常可不动；程序发现全图过亮/过暗时也会自动改用自适应阈值兜底。",
+    "THRESHOLD_TOL": "【灰度容差 / “接近阈值也算柱子”】灰度略低于“二值化阈值”但在容差范围内的像素，"
+                     "也会被当成柱子材料选中。=0 即严格大于阈值；>0 会把阈值附近较暗的过渡像素包含进来，"
+                     "让柱子更完整，但太大容易把背景噪声包进来。",
+    "MORPH_CLOSE_K": "【给柱子“补洞去毛”的力度】柱子内部小黑点、侧壁毛刺会被填平修整，看起来更干净。"
+                     "柱体很粗壮 → 可以加大；柱与柱很近（间隔小于此值）会把两根黏成一根 → 要调小。",
+    "SMOOTH_KERNEL": "【剖面曲线的平滑度】把整幅图沿水平方向“压扁”成一条亮度剖面后先平滑再找柱子分界。"
+                     "数值越大曲线越平滑。误把一根柱顶部的小凹陷切成两根 → 加大；柱子彼此贴得很近分不开 → 调小。",
+    "VALLEY_RATIO": "【多低的“山谷”才切开】以剖面最高峰为 1，亮度跌到该比例以下才认为是柱与柱之间的谷槽。"
+                    "想要把靠在一起的柱多切几根 → 调大；一根柱老被多切一刀 → 调小。",
+    "MIN_COLUMN_HEIGHT": "【太矮的不算柱】高度低于该值的亮块（刻度、文字、噪声）直接忽略。"
+                         "把杂物当成了柱 → 调大；真正的短柱被丢掉了 → 调小。",
+    "MIN_AVG_WIDTH": "【太窄的不算柱】平均宽度低于该值的细条（字母笔画、亮线）忽略。"
+                     "看到统计里多出“文字柱” → 调大（但别超过真实柱宽）。",
+    "MIN_ASPECT_RATIO": "【扁片不算柱】高度 ÷ 平均宽度 小于该值说明是横躺的亮斑而不是竖立的柱，排除。"
+                        "底座的亮带被当成柱 → 调大。",
+    "BOTTOM_OFFSET": "【给柱底“加裙边”】把识别出的柱底再向下多延伸几像素，让底边落在基座上、轮廓更整齐。"
+                     "底部边缘参差不齐可适当调大。",
+    "EDGE_MARGIN": "【四边留白】把图像四周这一宽度的边裁掉并置黑，防止黑框、标尺、白边混进识别结果。",
+    "WINDOW_MARGIN": "【追踪侧壁的容错】逐行向下扫描时，允许当前行相对上一行向左右“飘”多少像素仍算同一根柱。"
+                     "柱壁边缘模糊/断续 → 加大；容易串到隔壁柱子 → 调小。",
+    "SCALE_PIXELS": "【比例尺占多少像素】先量出图上标尺的长度（用“直线量测”工具可直接量），把像素数填这里。"
+                    "例如标尺标注 50 nm、量得 100 px，就填 100。",
+    "SCALE_NM": "【标尺对应多少纳米】与上面同一段标尺的真实长度。换算比例会自动算出（见下方“1 px = xx nm”）。"
+                "比例尺只影响 nm 版结果与统计表，不影响找柱子。",
+    "OUTPUT_SUBDIR": "【结果放哪里】勾选 = 每张图一个同名文件夹；不勾 = 全部直接放图像文件夹根目录。",
+    "DEBUG_OUTPUT": "【出图诊断】勾选后会额外保存一张“二值化中间图”（*_debug_binary.png），"
+                    "可以一眼看出阈值取的是否合适，方便调参。",
 }
 
 # 生成文件的来源标记说明（帮助 → 输出文件说明 里的简短行）
 FILE_TAG_HELP = (
-    "文件名中的 _tool 表示“工具自动整图分析”生成，_user 表示“你在图上框选后由套索分析”生成；\n"
+    "文件名中的 _tool 表示“工具自动整图分析”生成，_user 表示“框选套索分析”生成；\n"
     "两类结果都放在同一张图对应的输出目录里，互不覆盖。\n"
-    "· 自动(tool)：xx_tool_result.png / xx_tool_result_nm.png / xx_tool_boundaries.txt /\n"
-    "              xx_tool_boundaries_nm.txt / xx_tool_stats_nm.txt\n"
-    "· 套索(user)：xx_user_result.png / xx_user_result_nm.png / xx_user_boundaries.txt /\n"
-    "              xx_user_boundaries_nm.txt / xx_user_stats_nm.txt"
+    "· 自动(tool)：xx_tool_result.png / xx_tool_boundaries.txt / xx_tool_stats_nm.txt\n"
+    "· 套索(user)：xx_user_result.png / xx_user_boundaries.txt / xx_user_stats_nm.txt"
 )
 
 FORMULA_HELP = """统计口径与计算公式说明（单位统一为 nm；像素 px 与 nm 的换算系数 k = SCALE_NM / SCALE_PIXELS）
@@ -1211,31 +1225,46 @@ FORMULA_HELP = """统计口径与计算公式说明（单位统一为 nm；像�
 
 
 class App(tk.Tk):
+    _img_x = _img_y = 0  # 类级声明，便于类型检查识别
+
     def __init__(self):
         super().__init__()
         self.title("PR 柱子自动识别与测量工具")
         self.geometry("1640x960")
-        self.minsize(1240, 720)
+        self.minsize(1280, 720)
 
         self.q = queue.Queue()
         self.running = False
         self.last_dir = core.INPUT_DIR       # 最后处理的目录（“打开输出文件夹”用）
-        self._prev = None                    # (原始BGR, 涂色BGR, 文件名)，供图像列显示
+        # 预览状态：原始图 / 工具自动 / 人工（框选套索）分别存放
+        self._orig_bgr = None                # 原始灰度转 BGR，画布显示
+        self._tool_bgr = None                # 工具自动识别彩色预览
+        self._user_bgr = None                # 人工（框选套索）彩色预览
         self._photos = []                    # 保存 tk.PhotoImage 引用，防止被回收
         self._resize_job = None
+        self._live_job = None                # 参数实时重识别的防抖任务
         self._scale = 1.0                    # 当前原图显示缩放（canvas 像素 → 原图像素）
+        self._ow = 0                         # 当前原图尺寸（首次加载图像后更新）
+        self._oh = 0
         self._roi = None                     # 框选矩形：整图像素坐标 (x0,y0,x1,y1)
         self._drag = None                    # 正在拖拽画框
         self._drag_id = None                 # 拖拽过程中的临时矩形
         self._m1 = None                      # 直线量测：第一点（原图像素）
         self._m2 = None                      # 直线量测：第二点（原图像素）
         self._mv_id = None                   # 量测过程中的临时连线
-        self._last_stem = None               # 当前预览图 stem
-        self._last_out_tag = "_tool"         # 生成文件来源标记：_tool 自动 / _user 用户套索
+        self._ang = []                       # 角度量测：三个点 (A端点, 顶点V, C端点)
+        self._last_img_name = None           # 当前预览的 tif 文件名（basename）
+        self._last_out_tag = "_tool"         # 最近结果来源：_tool / _user
+        self._last_manual_tag = "_user"      # 最近一次人工结果（框选套索 _user）
+        self._last_stat_src = {"tool": None, "user": None}   # 最近加载的统计源文件
+        self._analyzed = []                  # 本会话已分析的 stem（文件列表用）
 
         self._build_ui()
         self._refresh_files()
         self.last_dir = self._folder()   # 打开输出文件夹：默认跟随界面所选文件夹
+        # 左侧识别/比例尺参数一旦变化 → 防抖 300ms 后自动对当前图重新跑一次自动识别
+        for _var in list(self.spins.values()) + list(self.scale_vars.values()):
+            _var.trace_add("write", self._schedule_live)
         self.after(80, self._drain_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1245,6 +1274,24 @@ class App(tk.Tk):
     def _build_ui(self):
         try:
             ttk.Style(self).theme_use("vista")
+        except tk.TclError:
+            pass
+        # ---- 全局观感（仅调字体/标题配色，不影响任何图像坐标计算） ----
+        try:
+            st = ttk.Style(self)
+            st.configure(".", font=("Microsoft YaHei UI", 9))
+            st.configure("TLabelframe.Label",
+                         font=("Microsoft YaHei UI", 9, "bold"),
+                         foreground="#175a7a")
+            st.configure("TCheckbutton", font=("Microsoft YaHei UI", 9))
+            st.configure("TRadiobutton", font=("Microsoft YaHei UI", 9))
+            st.configure("TButton", font=("Microsoft YaHei UI", 9))
+            st.configure("Tool.TLabelframe.Label",
+                         font=("Microsoft YaHei UI", 9, "bold"),
+                         foreground="#0f7b45")
+            st.configure("User.TLabelframe.Label",
+                         font=("Microsoft YaHei UI", 9, "bold"),
+                         foreground="#8a4b08")
         except tk.TclError:
             pass
 
@@ -1345,79 +1392,123 @@ class App(tk.Tk):
                   foreground="#888888", justify="left", wraplength=400).pack(anchor="w", padx=8, pady=(8, 6))
         self._update_scale_info()
 
-        # ---- 第二列：ROI 工具栏 + 原始图(canvas) + 识别涂色图 ----
+        # ---- 已分析文件（左下角）----
+        hf = ttk.LabelFrame(left, text="已分析文件（单击载入该图，可继续框选 / 量测）")
+        hf.pack(fill="both", expand=True, padx=4, pady=(8, 4))
+        f_body = ttk.Frame(hf)
+        f_body.pack(fill="both", expand=True, padx=2, pady=2)
+        self.lst_files = tk.Listbox(f_body, height=6, exportselection=False,
+                                    font=("Microsoft YaHei UI", 9),
+                                    relief="flat", highlightthickness=1,
+                                    highlightbackground="#c9d4dc")
+        self.lst_files.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
+        f_sb = ttk.Scrollbar(f_body, orient="vertical", command=self.lst_files.yview)
+        f_sb.pack(side="left", fill="y", pady=4)
+        self.lst_files.configure(yscrollcommand=f_sb.set)
+        self.lst_files.bind("<<ListboxSelect>>", self._on_pick_file)
+
+        # ---- 第二列：工具栏 + 原始图(canvas) + 双预览(tool/user) + 已分析文件列表 ----
         self.frm_mid = ttk.Frame(body)
         self.frm_mid.pack(side="left", fill="both", expand=True, padx=6)
+        # row1(原始图)/row2(双预览) 各占半屏；row0=工具条、row3=文件列表固定高度
         self.frm_mid.grid_rowconfigure(1, weight=1)
         self.frm_mid.grid_rowconfigure(2, weight=1)
         self.frm_mid.grid_columnconfigure(0, weight=1)
 
         roibar = ttk.Frame(self.frm_mid)
         roibar.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        roibar.grid_columnconfigure(0, weight=1)
+
+        # —— 工具单选行 ——
+        tools = ttk.Frame(roibar)
+        tools.grid(row=0, column=0, sticky="w")
         self.var_canvas_tool = tk.StringVar(value="roi")
-        ttk.Radiobutton(roibar, text="框选区域", value="roi", variable=self.var_canvas_tool,
+        ttk.Radiobutton(tools, text="框选区域", value="roi", variable=self.var_canvas_tool,
                         command=self._on_tool_change).pack(side="left")
-        ttk.Radiobutton(roibar, text="直线量测", value="measure", variable=self.var_canvas_tool,
+        ttk.Radiobutton(tools, text="直线量测", value="dist", variable=self.var_canvas_tool,
                         command=self._on_tool_change).pack(side="left", padx=(10, 0))
-        self.lbl_roi_info = ttk.Label(roibar, text="提示：在原始图上按住左键拖出矩形分析区域",
-                                      foreground="#555555")
-        self.lbl_roi_info.pack(side="left", padx=8)
-        self.btn_roi_clear = ttk.Button(roibar, text="清除", command=self._clear_canvas_marks,
-                                        width=6)
-        self.btn_roi_clear.pack(side="left")
-        self.btn_roi_run = ttk.Button(roibar, text="▶ 套索分析所选区域",
+        ttk.Radiobutton(tools, text="角度量测", value="angle", variable=self.var_canvas_tool,
+                        command=self._on_tool_change).pack(side="left", padx=(10, 0))
+        btns = ttk.Frame(roibar)
+        btns.grid(row=0, column=1, sticky="e")
+        self.btn_roi_run = ttk.Button(btns, text="▶ 套索分析所选区域",
                                       command=self._start_roi)
         self.btn_roi_run.pack(side="right")
+        self.btn_roi_clear = ttk.Button(btns, text="清除标记", command=self._clear_canvas_marks,
+                                        width=8)
+        self.btn_roi_clear.pack(side="right", padx=(0, 8))
 
-        self.frm_orig = ttk.LabelFrame(self.frm_mid, text="原始图像（框选区域 / 直线量测，工具在上方切换）")
+        # —— 提示行 ——
+        self.lbl_roi_info = ttk.Label(roibar, text="提示：在原始图上按住左键拖出矩形框选分析区域",
+                                      foreground="#555555")
+        self.lbl_roi_info.grid(row=1, column=0, columnspan=2, sticky="w", padx=2, pady=(2, 0))
+
+        # —— 原始图画布（框选/量测都在上面进行）——
+        self.frm_orig = ttk.LabelFrame(self.frm_mid,
+                                       text="原始图像（工具在上方切换：框选区域 / 直线量测 / 角度量测）")
         self.frm_orig.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
-        self.cv_orig = tk.Canvas(self.frm_orig, bg="white", highlightthickness=0,
+        self.cv_orig = tk.Canvas(self.frm_orig, bg="#f2f4f7", highlightthickness=0,
                                  cursor="crosshair")
         self.cv_orig.pack(fill="both", expand=True)
         self._bind_canvas()
 
-        self.frm_paint = ttk.LabelFrame(self.frm_mid, text="识别结果（彩色涂色）")
-        self.frm_paint.grid(row=2, column=0, sticky="nsew", padx=2, pady=2)
-        self.lbl_paint = tk.Label(self.frm_paint, text="（识别预览）", bg="white",
-                                  fg="#999999")
-        self.lbl_paint.pack(expand=True)
+        # —— 第二行：左=工具自动预览，右=人工预览，各自带保存按钮 ——
+        self.frm_results = ttk.Frame(self.frm_mid)
+        self.frm_results.grid(row=2, column=0, sticky="nsew", padx=2, pady=2)
+        self.frm_results.grid_columnconfigure(0, weight=1)
+        self.frm_results.grid_columnconfigure(1, weight=1)
+        self.frm_results.grid_rowconfigure(0, weight=1)
+
+        self.frm_tool = ttk.LabelFrame(self.frm_results, text="工具自动识别预览（_tool）",
+                                       style="Tool.TLabelframe")
+        self.frm_tool.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        self.lbl_tool = tk.Label(self.frm_tool, text="（尚无自动识别结果）", bg="white",
+                                 fg="#999999")
+        self.lbl_tool.pack(fill="both", expand=True)
+        self.btn_save_tool = ttk.Button(self.frm_tool, text="保存本图识别结果…",
+                                        command=lambda: self._save_preview_img("tool"))
+        self.btn_save_tool.pack(pady=(0, 4))
+
+        self.frm_user = ttk.LabelFrame(self.frm_results, text="人工识别预览（_user）",
+                                       style="User.TLabelframe")
+        self.frm_user.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
+        self.lbl_user = tk.Label(self.frm_user, text="（尚无人工识别结果）", bg="white",
+                                 fg="#999999")
+        self.lbl_user.pack(fill="both", expand=True)
+        self.btn_save_user = ttk.Button(self.frm_user, text="保存本图识别结果…",
+                                        command=lambda: self._save_preview_img("user"))
+        self.btn_save_user.pack(pady=(0, 4))
 
         self.frm_mid.bind("<Configure>", self._on_mid_resize)
 
-        # ---- 第三列：统计分析表（无日志区） ----
+        # ---- 第三列：统计分上下两块（上=自动 tool，下=人工 user），各自带保存按钮 ----
+        # 关键：该列宽度不能随表格内容自由撑大，否则统计列数一多就会“推挤”中间图像列。
+        # pack_propagate 只对 pack 子部件生效，这里子部件用 grid 摆放，
+        # 因此要同时关掉 grid 传播，宽度才会真正锁死在 width=460。
+        # 当内容真的放不下时，会自动把窗口整体向右加宽，而不是挤压中列。
         right = ttk.Frame(body, width=460)
-        right.pack(side="left", fill="y", padx=(6, 0))
         right.pack_propagate(False)
-        right.grid_rowconfigure(0, weight=1)
+        right.grid_propagate(False)
+        right.pack(side="left", fill="y", padx=(6, 0))
+        right.grid_rowconfigure(0, weight=3)
+        right.grid_rowconfigure(1, weight=2)
         right.grid_columnconfigure(0, weight=1)
+        self._right_frame = right
 
-        stf = ttk.LabelFrame(right, text="统计分析  (高度·三段CD·比值·侧壁角·粗糙度)")
-        stf.grid(row=0, column=0, sticky="nsew")
-        self.var_stat_title = tk.StringVar(value="运行后在此显示当前图像的统计结果")
-        ttk.Label(stf, textvariable=self.var_stat_title,
-                  foreground="#555555", wraplength=430).pack(anchor="w", padx=8, pady=(3, 0))
-        tcol = ttk.Frame(stf)
-        tcol.pack(fill="both", expand=True, padx=4, pady=2)
-        self.tree = ttk.Treeview(tcol, columns=("avg",), show="tree headings",
-                                 selectmode="none")
-        self.tree.heading("#0", text="计算项")
-        self.tree.heading("avg", text="")
-        self.tree.column("#0", width=205, minwidth=150, anchor="w", stretch=True)
-        self.tree.column("avg", width=80, minwidth=70, anchor="e", stretch=False)
-        self.tree.tag_configure("cat", font=("Microsoft YaHei UI", 9, "bold"),
-                                background="#e8f0e8")
-        self.tree.tag_configure("odd", background="#f4f7f4")
-        ys = ttk.Scrollbar(tcol, orient="vertical", command=self.tree.yview)
-        xs = ttk.Scrollbar(tcol, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
-        xs.grid(row=1, column=0, sticky="ew")
-        tcol.grid_rowconfigure(0, weight=1)
-        tcol.grid_columnconfigure(0, weight=1)
-        ttk.Label(stf, text="侧壁角：边缘沿柱壁向下与 +x 轴的夹角，90°=竖直，可 >90°（向左倾）；LER=去趋势边缘残差 3σ。",
-                  foreground="#888888", wraplength=430, justify="left").pack(
-            anchor="w", padx=8, pady=(0, 4))
+        self._stat_blocks = {}
+        self._stats_trees = {}
+        for _i, (_k, _t) in enumerate((("tool", "上：工具自动识别统计（_tool）"),
+                                       ("user", "下：人工识别统计（_user）"))):
+            blk = self._make_stats_block(right, _t)
+            blk["frame"].grid(row=_i, column=0, sticky="nsew", padx=2,
+                              pady=(0, 2) if _i else (0, 2))
+            blk["save"].configure(command=lambda k=_k: self._save_stats_txt(k))
+            self._stat_blocks[_k] = blk
+            self._stats_trees[_k] = blk["tree"]
+        # 兼容旧的直接引用（仍指向“上：自动”面板）
+        self.tree = self._stat_blocks["tool"]["tree"]
+        self.var_stat_title = self._stat_blocks["tool"]["var"]
+        self.var_stat_title_user = self._stat_blocks["user"]["var"]
 
         # ---------------- 最底部：正在识别的图片 + 进度 ----------------
         bar = ttk.Frame(self)
@@ -1428,6 +1519,112 @@ class App(tk.Tk):
         self.pbar.pack(side="right", padx=(10, 4))
         self.lbl_pct = ttk.Label(bar, text="0%", width=5)
         self.lbl_pct.pack(side="right")
+
+    # ===================================================================
+    # 第三列统计面板构建（上下两块共用）
+    # ===================================================================
+    def _make_stats_block(self, parent, title):
+        """返回 dict：frame / tree / var / save，供上下两块统计面板使用。"""
+        frame = ttk.LabelFrame(parent, text=title)
+        var = tk.StringVar(value="（尚无结果）")
+        ttk.Label(frame, textvariable=var, foreground="#555555",
+                  wraplength=420).pack(anchor="w", padx=6, pady=(2, 0))
+        tcol = ttk.Frame(frame)
+        tcol.pack(fill="both", expand=True, padx=4, pady=2)
+        tree = ttk.Treeview(tcol, columns=("avg",), show="tree headings",
+                            selectmode="none")
+        tree.heading("#0", text="计算项")
+        tree.heading("avg", text="")
+        tree.column("#0", width=205, minwidth=150, anchor="w", stretch=True)
+        tree.column("avg", width=80, minwidth=70, anchor="e", stretch=False)
+        tree.tag_configure("cat", font=("Microsoft YaHei UI", 9, "bold"),
+                           background="#e8f0e8")
+        tree.tag_configure("odd", background="#f4f7f4")
+        ys = ttk.Scrollbar(tcol, orient="vertical", command=tree.yview)
+        xs = ttk.Scrollbar(tcol, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        tcol.grid_rowconfigure(0, weight=1)
+        tcol.grid_columnconfigure(0, weight=1)
+        foot = ttk.Frame(frame)
+        foot.pack(fill="x", padx=4, pady=(0, 2))
+        save = ttk.Button(foot, text="保存该统计表另存为…", width=20)
+        save.pack(side="left")
+        ttk.Label(foot, text="列多时用底部横条滚动",
+                  foreground="#888888").pack(side="left", padx=6)
+        return {"frame": frame, "tree": tree, "var": var, "save": save}
+
+    # ===================================================================
+    # 左侧参数实时刷新（防抖 300ms → 重新自动识别当前图）
+    # ===================================================================
+    def _schedule_live(self, *_args):
+        if self.running or not self._last_img_name:
+            return
+        # 输入尚未成为合法数值时不触发，避免打字过程中反复弹错
+        for _var in list(self.spins.values()) + list(self.scale_vars.values()):
+            try:
+                float(_var.get().strip().replace("，", ".").replace(",", "."))
+            except ValueError:
+                return
+        if self._live_job is not None:
+            self.after_cancel(self._live_job)
+        self._live_job = self.after(300, self._run_live)
+
+    def _run_live(self):
+        self._live_job = None
+        if self.running or not self._last_img_name:
+            return
+        p = os.path.join(self._folder(), self._last_img_name)
+        if not os.path.isfile(p):
+            return
+        self._start_jobs([{"path": p, "mode": "full", "roi": None}],
+                         f"参数变化 → 自动重识别：{self._last_img_name} …")
+
+    # ===================================================================
+    # 保存按钮（预览图 / 统计表）
+    # ===================================================================
+    def _save_preview_img(self, kind):
+        if kind == "tool":
+            bgr, tag = self._tool_bgr, "_tool"
+        else:
+            bgr, tag = self._user_bgr, (self._last_manual_tag or "_user")
+        if bgr is None or not self._last_img_name:
+            messagebox.showwarning("提示", "当前没有对应的识别预览可保存。")
+            return
+        stem = os.path.splitext(self._last_img_name)[0]
+        out_dir = os.path.join(self._folder(), stem) if self.var_subdir.get() else self._folder()
+        os.makedirs(out_dir, exist_ok=True)
+        dflt = os.path.join(out_dir, f"{stem}_{tag[1:]}_preview.png")
+        p = filedialog.asksaveasfilename(
+            title="保存识别结果预览图",
+            initialdir=out_dir,
+            initialfile=os.path.basename(dflt),
+            defaultextension=".png",
+            filetypes=[("PNG 图像", "*.png")])
+        if p:
+            cv2.imwrite(p, bgr)
+            self.var_status.set(f"预览图已保存：{p}")
+
+    def _save_stats_txt(self, kind):
+        src = self._last_stat_src.get(kind)
+        if not src or not os.path.isfile(src):
+            messagebox.showwarning("提示", "该侧目前没有可保存的统计结果。")
+            return
+        dflt = os.path.splitext(src)[0] + "_copy.txt"
+        p = filedialog.asksaveasfilename(
+            title=f"保存{ '自动' if kind == 'tool' else '人工'}统计表",
+            initialdir=os.path.dirname(src) or self._folder(),
+            initialfile=os.path.basename(dflt),
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        if p:
+            try:
+                shutil.copyfile(src, p)
+                self.var_status.set(f"统计表已保存：{p}")
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e))
 
     # ===================================================================
     # 图像列表 / 目录
@@ -1444,6 +1641,64 @@ class App(tk.Tk):
         self.combo["values"] = names
         if names and self.var_sel.get() not in names:
             self.var_sel.set(names[0])
+        # 目录切换/启动时：把磁盘上已有 _tool/_user 结果的 stem 并入列表
+        try:
+            for s in self._scan_disk_stems():
+                if s not in self._analyzed:
+                    self._analyzed.append(s)
+        except Exception:
+            pass
+        self._refresh_analyzed_list()
+
+    def _scan_disk_stems(self):
+        """扫描当前图像文件夹中已生成过 _tool/_user 结果图的 stem。"""
+        folder = self._folder()
+        if not os.path.isdir(folder):
+            return []
+        stems = []
+        for p in self._list_tifs():
+            stem = os.path.splitext(os.path.basename(p))[0]
+            cand_dirs = [folder]
+            if core.OUTPUT_SUBDIR:
+                cand_dirs.append(os.path.join(folder, stem))
+            found = False
+            for d in cand_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for fn in os.listdir(d):
+                    if fn.startswith(f"{stem}_") and fn.endswith("_result.png"):
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                stems.append(stem)
+        return stems
+
+    def _refresh_analyzed_list(self):
+        if not hasattr(self, "lst_files"):
+            return
+        names = []
+        for s in getattr(self, "_analyzed", []):
+            if s not in names:
+                names.append(s)
+        self.lst_files.delete(0, "end")
+        for s in names:
+            self.lst_files.insert("end", s)
+
+    def _on_pick_file(self, _evt=None):
+        if self.running:
+            return
+        sel = self.lst_files.curselection()
+        if not sel:
+            return
+        stem = self.lst_files.get(sel[0])
+        # 找出对应 tif 名称（可能有 .tif/.tiff 两种扩展名）
+        match = [n for n in (self.combo["values"] or []) if n.startswith(stem)]
+        if not match:
+            return
+        self.var_sel.set(match[0])
+        self._start_single()
 
     def _browse_dir(self):
         d = filedialog.askdirectory(initialdir=self.var_dir.get() or core.INPUT_DIR,
@@ -1483,58 +1738,134 @@ class App(tk.Tk):
             return None
         return tk.PhotoImage(data=buf.tobytes())
 
-    def _set_preview(self, orig_bgr, paint_bgr, name):
-        self._prev = (orig_bgr, paint_bgr, name)
-        self._roi = None        # 新图像 → 之前的框选区域/量测点作废
-        self._m1 = self._m2 = None
+    def _set_preview(self, tag, orig_bgr, paint_bgr, name):
+        # 切换到新图像时，作废旧图上的框选/量测标记；
+        # 同一张图的“自动 vs 人工”结果交替到达时保留标记。
+        changed = self._last_img_name != name
+        if changed:
+            self._roi = None
+            self._m1 = self._m2 = None
+            self._ang = []
+            self._user_bgr = None                # 上一张图的人工预览作废
+        self._last_img_name = name
+        self._last_out_tag = tag
+        self._orig_bgr = orig_bgr
+        if tag == "_tool":
+            self._tool_bgr = paint_bgr
+            if self._user_bgr is None:
+                self._try_load_manual_from_disk()   # 磁盘上若已有 _user 结果则一并显示
+        else:                                    # _user（框选套索）
+            self._user_bgr = paint_bgr
+            self._last_manual_tag = "_user"
+        stem = os.path.splitext(os.path.basename(name))[0]
+        if stem not in self._analyzed:
+            self._analyzed.append(stem)
+        self._refresh_analyzed_list()
         self._redraw_preview()
+        self._refresh_stats_kind("tool")
+        self._refresh_stats_kind("user")
+
+    def _try_load_manual_from_disk(self):
+        """当前图若磁盘上已有 _user 人工结果图，则读进来显示在人工预览格。"""
+        if not self._last_img_name:
+            return
+        stem = os.path.splitext(self._last_img_name)[0]
+        base = self._folder()
+        cand_dirs = [base]
+        if core.OUTPUT_SUBDIR:
+            cand_dirs.insert(0, os.path.join(base, stem))
+        for d in cand_dirs:
+            p = os.path.join(d, f"{stem}_user_result.png")
+            if os.path.isfile(p):
+                bgr = cv2.imread(p)
+                if bgr is not None:
+                    self._user_bgr = bgr
+                    self._last_manual_tag = "_user"
+                return
+
+    def _put_stream(self, kind):
+        """把 tool/user 其中一路预览 BGR 缩放到对应 label。"""
+        if kind == "tool":
+            bgr = self._tool_bgr
+            frm, lbl = self.frm_tool, self.lbl_tool
+            note = "自动识别结果"
+            frmlbl = "工具自动识别预览（_tool）"
+        else:
+            bgr = self._user_bgr
+            frm, lbl = self.frm_user, self.lbl_user
+            note = "人工识别结果"
+            frmlbl = "人工识别预览（_user）"
+        if bgr is None:
+            lbl.configure(image="", text=f"（尚无{note}：请运行自动识别 / 框选套索）")
+            frm.configure(text=frmlbl)
+            return
+        iw, ih = bgr.shape[1], bgr.shape[0]
+        # 容器实际尺寸（label 与框架之间留少量边距）
+        w = max(int(frm.winfo_width()) - 8, 80)
+        h = max(int(frm.winfo_height()) - 44, 60)
+        s = min(1.0, w / iw, h / ih)
+        s = max(s, 0.02)
+        draw = bgr
+        if s < 1.0:
+            draw = cv2.resize(draw, (max(int(iw * s), 1), max(int(ih * s), 1)),
+                              interpolation=cv2.INTER_AREA)
+        ph = self._bgr_to_photo(draw) or tk.PhotoImage(width=1, height=1)
+        self._photos.append(ph)
+        lbl.configure(image=ph, text="")
+        frm.configure(text=f"{frmlbl}  {self._last_img_name or ''}  ({iw}×{ih})")
 
     def _redraw_preview(self):
         self._resize_job = None
         self.cv_orig.delete("all")
-        if self._prev is None:
+        self._photos = []
+        if self._orig_bgr is None:
             self._placeholder()
+            self.lbl_tool.configure(image="", text="（尚无自动识别结果）")
+            self.lbl_user.configure(image="", text="（尚无人工识别结果）")
             return
         self.update_idletasks()
-        cw = max(self.frm_mid.winfo_width() - 24, 60)
-        ch = max(self.frm_mid.winfo_height() - 40, 60)
-        per_h = max((ch - 14) // 2, 30)
-        orig, paint, name = self._prev
-        # 统一缩放因子，让两张图比例一致地放进各自半区
-        s = min(1.0,
-                cw / paint.shape[1], cw / orig.shape[1],
-                per_h / paint.shape[0], per_h / orig.shape[0])
+        ow, oh = self._orig_bgr.shape[1], self._orig_bgr.shape[0]
+        self._ow, self._oh = ow, oh
+        cw = max(self.cv_orig.winfo_width() - 4, 60)
+        ch = max(self.cv_orig.winfo_height() - 4, 60)
+        s = min(1.0, cw / ow, ch / oh)
         s = max(s, 0.02)
         self._scale = s
-        self._ow, self._oh = orig.shape[1], orig.shape[0]
-        photos = []
-        for img in (orig, paint):
-            if s < 1.0:
-                img = cv2.resize(img, (int(img.shape[1] * s), int(img.shape[0] * s)),
-                                 interpolation=cv2.INTER_AREA)
-            ph = self._bgr_to_photo(img)
-            photos.append(ph if ph is not None else tk.PhotoImage(width=1, height=1))
-        self._photos = photos
-        self.frm_orig.configure(text=f"原始图像（左键拖框=选取分析区域）  {name}"
-                                     f"  ({orig.shape[1]}×{orig.shape[0]})")
-        self.frm_paint.configure(text=f"识别结果（彩色涂色）  {name}")
-        self.cv_orig.create_image(0, 0, anchor="nw", image=photos[0])
-        self.lbl_paint.configure(image=photos[1], text="")
+        draw = self._orig_bgr
+        if s < 1.0:
+            draw = cv2.resize(draw, (max(int(ow * s), 1), max(int(oh * s), 1)),
+                              interpolation=cv2.INTER_AREA)
+        ph = self._bgr_to_photo(draw) or tk.PhotoImage(width=1, height=1)
+        self._photos.append(ph)
+        x = 0
+        y = 0
+        self._img_x = x
+        self._img_y = y
+        self.cv_orig.create_image(x, y, anchor="nw", image=ph)
+        self.frm_orig.configure(
+            text=f"原始图像（工具在上方切换：直线量测 / 角度量测 / 框选区域）  {self._last_img_name or ''}"
+                 f"  ({ow}×{oh})")
+        self._put_stream("tool")
+        self._put_stream("user")
         self._redraw_marks()
 
     def _placeholder(self):
         w = max(self.cv_orig.winfo_width(), 200)
         h = max(self.cv_orig.winfo_height(), 100)
         self.cv_orig.create_text(w // 2, h // 2,
-                                 text="（选择图像并点击“分析选中图像”或先拖框选区域再“套索分析”）",
-                                 fill="#999999", font=("Microsoft YaHei UI", 10))
+                                 text="（先在上方选择一张 tif 并“分析选中图像”；\n"
+                                      "    也可载入后：框选区域 做人工识别）",
+                                 fill="#999999", font=("Microsoft YaHei UI", 10),
+                                 justify="center")
 
     def _on_mid_resize(self, _evt=None):
-        if self._prev is not None and self._resize_job is None:
+        if self._orig_bgr is not None and self._resize_job is None:
             self._resize_job = self.after(120, self._redraw_preview)
 
     # ===================================================================
-    # 第二列画布交互：框选区域(roi) / 直线量测(measure)
+    # 第二列画布交互：框选区域(roi) / 直线量测(dist) / 角度量测(angle)
+    # 直线与角度量测打点时带“水平/竖直磁吸”：当新点与上一点连线接近
+    # 水平或竖直（±5°内）时，自动吸附成完全水平/竖直，方便对准柱壁等特征。
     # ===================================================================
     def _bind_canvas(self):
         self.cv_orig.bind("<ButtonPress-1>", self._cv_press)
@@ -1543,117 +1874,277 @@ class App(tk.Tk):
 
     def _cv_to_orig(self, ex, ey):
         """canvas 显示坐标 → 原图像素坐标（越界自动裁剪到图像内）。"""
-        ox = min(max(int(ex / self._scale), 0), self._ow - 1)
-        oy = min(max(int(ey / self._scale), 0), self._oh - 1)
+        ox = min(max(int((ex - self._img_x) / self._scale), 0), self._ow - 1)
+        oy = min(max(int((ey - self._img_y) / self._scale), 0), self._oh - 1)
         return ox, oy
+
+    def _orig_to_cv(self, x, y):
+        """原图像素坐标 → canvas 显示坐标（含居中偏移）。"""
+        return x * self._scale + self._img_x, y * self._scale + self._img_y
 
     def _tool(self):
         return self.var_canvas_tool.get()
 
     def _on_tool_change(self):
-        """切换工具：清空另一工具的标记，避免两类图元叠在一起造成误读。"""
+        """切换工具：只保留当前工具所需的标记。"""
         self._drag = None
-        if self._tool() == "measure":
+        t = self._tool()
+        if t == "roi":
+            self._m1 = self._m2 = None
+            self._ang = []
+        elif t == "dist":
             self._roi = None
-        else:
+            self._ang = []
+        elif t == "angle":
+            self._roi = None
             self._m1 = self._m2 = None
         self._redraw_marks()
 
     def _clear_canvas_marks(self):
         self._roi = None
         self._m1 = self._m2 = None
+        self._ang = []
         self._drag = None
         self._redraw_marks()
 
+    # ---- 水平/竖直磁吸 ----
+    def _snap_point(self, base, target):
+        """base→target 连线与水平/竖直夹角 ≤5° 时吸附成完全水平/竖直。
+
+        返回 (snapped_point, mode)，mode ∈ {'H','V',None}。
+        """
+        bx, by = base
+        tx, ty = target
+        dx, dy = tx - bx, ty - by
+        if dx == 0 and dy == 0:
+            return target, None
+        ang = math.atan2(abs(dy), abs(dx))          # 0~90°（与水平线的夹角）
+        tol = math.radians(5.0)
+        if ang < tol:
+            return (tx, by), "H"                     # 吸附为水平
+        if ang > math.pi / 2 - tol:
+            return (bx, ty), "V"                     # 吸附为竖直
+        return target, None
+
+    def _marker(self, x, y, fill, outline=None, radius=None):
+        s = self._scale
+        r = radius if radius is not None else max(int(3 * s), 2)
+        cx, cy = self._orig_to_cv(x, y)
+        self.cv_orig.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                 outline=outline or fill, fill=fill, tags="ovl")
+
+    def _pending_preview(self, base, e, color):
+        """画布移动时预览 base → 光标 的连线；接近水平/竖直时显示吸附参考线。"""
+        self._redraw_marks()
+        s = self._scale
+        tx, ty = self._cv_to_orig(e.x, e.y)
+        sp, mode = self._snap_point(base, (tx, ty))
+        sx, sy = sp
+        if mode == "H":                              # 吸附参考：过 snapped 点的水平线
+            x0, y0 = self._orig_to_cv(0, sy)
+            x1, y1 = self._orig_to_cv(self._ow, sy)
+            self.cv_orig.create_line(x0, y0, x1, y1,
+                                     fill="#00aa66", width=1, dash=(6, 4), tags="ovl")
+            note = "水平 已吸附"
+        elif mode == "V":
+            x0, y0 = self._orig_to_cv(sx, 0)
+            x1, y1 = self._orig_to_cv(sx, self._oh)
+            self.cv_orig.create_line(x0, y0, x1, y1,
+                                     fill="#00aa66", width=1, dash=(6, 4), tags="ovl")
+            note = "竖直 已吸附"
+        else:
+            note = None
+        bx, by = base
+        ax, ay = self._orig_to_cv(bx, by)
+        cx, cy = self._orig_to_cv(sx, sy)
+        self.cv_orig.create_line(ax, ay, cx, cy,
+                                 fill=color, width=2, dash=(3, 3), tags="ovl")
+        self._marker(sx, sy, "#55ff88", outline="#00804d")
+        if note:
+            tx, ty = self._orig_to_cv(sx, sy)
+            self.cv_orig.create_text(tx, max(ty - 6, self._img_y + 6), text=note,
+                                     fill="#00804d", anchor="s",
+                                     font=("Microsoft YaHei UI", 9, "bold"),
+                                     tags="ovl")
+
     # ---- 鼠标事件 ----
     def _cv_press(self, e):
-        if self.running or self._prev is None:
+        if self.running or self._orig_bgr is None:
             return
-        if self._tool() == "roi":
+        t = self._tool()
+        if t == "roi":
             self._drag = (e.x, e.y)
             return
-        # 直线量测：单击打点
         p = self._cv_to_orig(e.x, e.y)
-        if self._m1 is None:
-            self._m1 = p
-            self._m2 = None
-        elif self._m2 is None:
-            self._m2 = p
-        else:                      # 已测完一组 → 点击开始量测下一组
-            self._m1, self._m2 = p, None
-        self._redraw_marks()
+        if t == "dist":
+            if self._m1 is None:
+                self._m1, self._m2 = p, None
+            elif self._m2 is None:
+                self._m2, _ = self._snap_point(self._m1, p)
+            else:                                  # 已测完一组 → 开始下一组
+                self._m1, self._m2 = p, None
+            self._redraw_marks()
+            return
+        if t == "angle":                            # A端点 → 顶点V → C端点
+            if len(self._ang) < 3:
+                if self._ang:
+                    sp, _ = self._snap_point(self._ang[-1], p)
+                    p = sp
+                self._ang.append(p)
+            else:
+                self._ang = [p]
+            self._redraw_marks()
+            return
 
     def _cv_move(self, e):
-        if self.running or self._prev is None:
+        if self.running or self._orig_bgr is None:
             return
-        if self._tool() == "roi":
+        t = self._tool()
+        if t == "roi":
             if self._drag is None:
                 return
-            self._redraw_marks()   # 清除旧预览框
+            self._redraw_marks()                    # 清除旧预览框
             x0, y0 = self._drag
             self.cv_orig.create_rectangle(x0, y0, e.x, e.y,
                                           outline="#ff3333", width=2, dash=(5, 3),
                                           tags="ovl")
-        else:
-            # 量测中：第一点已定、第二点未定 → 实时预览连线
+            return
+        if t == "dist":
             if self._m1 is not None and self._m2 is None:
-                self._redraw_marks()
-                ax, ay = self._m1
-                self.cv_orig.create_line(ax * self._scale, ay * self._scale,
-                                         e.x, e.y,
-                                         fill="#0099ff", width=1, dash=(2, 2),
-                                         tags="ovl")
+                self._pending_preview(self._m1, e, "#0099ff")
+            return
+        if t == "angle":
+            if len(self._ang) == 1:
+                self._pending_preview(self._ang[0], e, "#cc6600")
+            elif len(self._ang) == 2:
+                self._pending_preview(self._ang[1], e, "#0099cc")
+            return
 
     def _cv_release(self, e):
-        if self._drag is None or self._tool() != "roi":
+        t = self._tool()
+        if t == "roi":
+            if self._drag is None:
+                return
+            x0, y0 = self._drag
+            self._drag = None
+            self._redraw_marks()
+            ax, ay = self._cv_to_orig(x0, y0)
+            bx, by = self._cv_to_orig(e.x, e.y)
+            if abs(bx - ax) < 3 and abs(by - ay) < 3:
+                return                      # 拖动过小视为误操作，仅清除预览
+            self._roi = (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+            self._redraw_marks()
             return
-        x0, y0 = self._drag
-        self._drag = None
-        self._redraw_marks()
-        ax, ay = self._cv_to_orig(x0, y0)
-        bx, by = self._cv_to_orig(e.x, e.y)
-        if abs(bx - ax) < 3 and abs(by - ay) < 3:
-            return                      # 拖动过小视为误操作，仅清除预览
-        self._roi = (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
-        self._redraw_marks()
 
     # ---- 覆盖图元绘制 ----
     def _clear_overlays(self):
         self.cv_orig.delete("ovl")
 
     def _redraw_marks(self):
-        """把 ROI 矩形与量测线段按当前缩放重画到原图 canvas 上。"""
-        if self._prev is None:
+        """按当前工具把框选矩形 / 量测标记重画到原图画布上。"""
+        if self._orig_bgr is None:
             return
         self._clear_overlays()
-        s = self._scale
-        if self._roi is not None:
+        t = self._tool()
+        if t == "roi" and self._roi is not None:
             x0, y0, x1, y1 = self._roi
-            self.cv_orig.create_rectangle(x0 * s, y0 * s, x1 * s, y1 * s,
+            x0, y0 = self._orig_to_cv(x0, y0)
+            x1, y1 = self._orig_to_cv(x1, y1)
+            self.cv_orig.create_rectangle(x0, y0, x1, y1,
                                           outline="#ff0000", width=2, dash=(5, 3),
                                           tags="ovl")
-        if self._m1 is not None:
-            ax, ay = self._m1
-            r = max(int(3 * s), 2)
-            self.cv_orig.create_oval(ax * s - r, ay * s - r, ax * s + r, ay * s + r,
-                                     outline="#0066ff", fill="#33aaff", tags="ovl")
-            if self._m2 is not None:
-                bx, by = self._m2
-                self.cv_orig.create_line(ax * s, ay * s, bx * s, by * s,
-                                         fill="#0066ff", width=2, tags="ovl")
-                self.cv_orig.create_oval(bx * s - r, by * s - r, bx * s + r, by * s + r,
-                                         outline="#0066ff", fill="#33aaff", tags="ovl")
-                px = math.hypot(bx - ax, by - ay)
-                self.cv_orig.create_text((ax + bx) * s / 2,
-                                         max(min((ay + by) * s / 2 - 8, self._oh * s - 10), 10),
-                                         text=f"L={px:.2f} px", fill="#0044cc",
-                                         font=("Microsoft YaHei UI", 9, "bold"),
-                                         tags="ovl")
+        elif t == "dist":
+            self._draw_dist()
+        elif t == "angle":
+            self._draw_angle()
         self._update_canvas_info()
+
+    def _draw_dist(self):
+        if self._m1 is None:
+            return
+        ax, ay = self._m1
+        self._marker(ax, ay, "#33aaff", outline="#0066ff")
+        if self._m2 is not None:
+            bx, by = self._m2
+            x0, y0 = self._orig_to_cv(ax, ay)
+            x1, y1 = self._orig_to_cv(bx, by)
+            self.cv_orig.create_line(x0, y0, x1, y1,
+                                     fill="#0066ff", width=2, tags="ovl")
+            self._marker(bx, by, "#33aaff", outline="#0066ff")
+            px = math.hypot(bx - ax, by - ay)
+            mx = (x0 + x1) / 2
+            my = max(min((y0 + y1) / 2 - 8,
+                         self._oh * self._scale + self._img_y - 10),
+                     self._img_y + 10)
+            self.cv_orig.create_text(mx, my,
+                                     text=f"L={px:.2f} px", fill="#0044cc",
+                                     font=("Microsoft YaHei UI", 9, "bold"),
+                                     tags="ovl")
+
+    def _angle_result(self):
+        """三点角 ∠A·V·C（0~180°）。返回 (deg, len1_px, len2_px) 或 None。"""
+        if len(self._ang) < 3:
+            return None
+        (ax, ay), (vx, vy), (cx, cy) = self._ang[:3]
+        ux, uy = ax - vx, ay - vy
+        wx, wy = cx - vx, cy - vy
+        lu, lw = math.hypot(ux, uy), math.hypot(wx, wy)
+        if lu == 0 or lw == 0:
+            return None
+        cos = max(-1.0, min(1.0, (ux * wx + uy * wy) / (lu * lw)))
+        return (math.degrees(math.acos(cos)), lu, lw)
+
+    def _draw_angle(self):
+        n = len(self._ang)
+        if n == 0:
+            return
+        ax, ay = self._ang[0]
+        self._marker(ax, ay, "#ffcc66", outline="#cc6600")
+        if n >= 2:
+            vx, vy = self._ang[1]
+            ax_, ay_ = self._orig_to_cv(ax, ay)
+            vx_, vy_ = self._orig_to_cv(vx, vy)
+            self.cv_orig.create_line(ax_, ay_, vx_, vy_,
+                                     fill="#cc6600", width=2, tags="ovl")
+            self._marker(vx, vy, "#ff6666", outline="#cc0000",
+                         radius=max(int(4 * self._scale), 3))
+            if n >= 3:
+                cx, cy = self._ang[2]
+                cx_, cy_ = self._orig_to_cv(cx, cy)
+                self.cv_orig.create_line(vx_, vy_, cx_, cy_,
+                                         fill="#0088cc", width=2, tags="ovl")
+                self._marker(cx, cy, "#66ccff", outline="#0066cc")
+                res = self._angle_result()
+                if res is not None:
+                    deg, lu, lw = res
+                    # 在顶点附近沿夹角平分线放置角度标注
+                    (ax, ay), (vx, vy), (cx, cy) = self._ang[:3]
+                    ux, uy = ax - vx, ay - vy
+                    wx, wy = cx - vx, cy - vy
+                    lu2, lw2 = math.hypot(ux, uy), math.hypot(wx, wy)
+                    dx = ux / lu2 + wx / lw2
+                    dy = uy / lu2 + wy / lw2
+                    dl = math.hypot(dx, dy)
+                    if dl < 1e-6:                   # 夹角接近 180°，取垂直方向
+                        dx, dy = -uy, ux
+                        dl = math.hypot(dx, dy) or 1.0
+                    s = self._scale
+                    rad = 34 * s
+                    tx = min(max(vx * s + dx / dl * rad + self._img_x,
+                                 self._img_x + 8),
+                             self._ow * s + self._img_x - 8)
+                    ty = min(max(vy * s + dy / dl * rad + self._img_y,
+                                 self._img_y + 8),
+                             self._oh * s + self._img_y - 8)
+                    self.cv_orig.create_text(tx, ty, text=f"∠={deg:.1f}°",
+                                             fill="#cc0000",
+                                             font=("Microsoft YaHei UI", 9, "bold"),
+                                             tags="ovl")
 
     def _update_canvas_info(self):
         """根据当前工具与已绘制内容，更新工具条左侧的提示/结果文字。"""
-        if self._tool() == "measure":
+        t = self._tool()
+        if t == "dist":
             if self._m1 is not None and self._m2 is not None:
                 ax, ay = self._m1
                 bx, by = self._m2
@@ -1664,10 +2155,32 @@ class App(tk.Tk):
                     txt += f"（≈{nm:.2f} nm）"
                 self.lbl_roi_info.configure(text=txt, foreground="#0055bb")
             elif self._m1 is not None:
-                self.lbl_roi_info.configure(text="量测中：请单击第二个点 B …", foreground="#aa5500")
+                self.lbl_roi_info.configure(text="直线量测：A 已定，请单击 B（接近水平/竖直自动吸附）",
+                                            foreground="#aa5500")
             else:
                 self.lbl_roi_info.configure(
-                    text="提示：单击 A 点后再单击 B 点，量测两点间直线长度",
+                    text="提示：单击 A、B 两点量测距离；接近水平/竖直自动吸附",
+                    foreground="#555555")
+        elif t == "angle":
+            n = len(self._ang)
+            res = self._angle_result() if n >= 3 else None
+            if res is not None:
+                deg, lu, lw = res
+                nm1, nm2 = self._px_to_nm(lu), self._px_to_nm(lw)
+                txt = (f"角度量测：∠={deg:.1f}°   边长 "
+                       f"{lu:.1f}/{lw:.1f} px")
+                if nm1 is not None and nm2 is not None:
+                    txt += f"（{nm1:.1f}/{nm2:.1f} nm）"
+                self.lbl_roi_info.configure(text=txt, foreground="#cc0000")
+            elif n == 2:
+                self.lbl_roi_info.configure(text="角度量测：顶点 V 已定，请单击 C 点确定另一条边",
+                                            foreground="#aa5500")
+            elif n == 1:
+                self.lbl_roi_info.configure(text="角度量测：A 点已定，请单击顶点 V",
+                                            foreground="#aa5500")
+            else:
+                self.lbl_roi_info.configure(
+                    text="提示：角度量测按 A端点 → 顶点V → C端点 依次单击三个点",
                     foreground="#555555")
         else:
             if self._roi is None:
@@ -1697,9 +2210,9 @@ class App(tk.Tk):
         folder = self.var_dir.get().strip().strip('"')
         if not folder or not os.path.isdir(folder):
             raise ValueError("图像文件夹不存在，请先选择有效的文件夹。")
-        core.INPUT_DIR = os.path.normpath(folder)
-        core.OUTPUT_SUBDIR = bool(self.var_subdir.get())
-        core.DEBUG_OUTPUT = bool(self.var_debug.get())
+        core.INPUT_DIR = os.path.normpath(folder)      # pyright: ignore[reportAttributeAccessIssue]
+        core.OUTPUT_SUBDIR = bool(self.var_subdir.get())  # pyright: ignore[reportAttributeAccessIssue]
+        core.DEBUG_OUTPUT = bool(self.var_debug.get())  # pyright: ignore[reportAttributeAccessIssue]
         for attr, name, kind, *_ in MAIN_PARAMS:
             raw = self.spins[attr].get().strip().replace("，", ".")
             val = int(raw) if kind == "int" else float(raw)
@@ -1714,9 +2227,7 @@ class App(tk.Tk):
 
     def _make_cb(self, out_tag):
         def cb(orig, paint, name):
-            self._last_stem = os.path.splitext(os.path.basename(name))[0]
-            self._last_out_tag = out_tag
-            self.q.put(("img", orig, paint, name))
+            self.q.put(("img", out_tag, orig, paint, name))
         return cb
 
     def _start_jobs(self, jobs, label):
@@ -1733,6 +2244,12 @@ class App(tk.Tk):
             if not os.path.isfile(j["path"]):
                 messagebox.showwarning("提示", f"文件不存在：{j['path']}")
                 return
+        # 批量分析时，旧图的框选/量测标记不应带到下一张图
+        if len(jobs) > 1:
+            self._roi = None
+            self._m1 = self._m2 = None
+            self._ang = []
+            self._redraw_marks()
         self._set_running(True)
         self.last_dir = core.INPUT_DIR
         self.var_status.set(label)
@@ -1762,10 +2279,10 @@ class App(tk.Tk):
         self._start_jobs(jobs, f"准备批量分析（{len(paths)} 张）…")
 
     def _start_roi(self):
-        if self._roi is None or self._prev is None:
+        if self._roi is None or self._orig_bgr is None:
             messagebox.showwarning("提示", "请先在原始图像上按住左键拖出矩形分析区域。")
             return
-        name = self._prev[2]
+        name = self._last_img_name
         p = os.path.join(self._folder(), name)
         if not os.path.isfile(p):
             messagebox.showwarning("提示",
@@ -1793,7 +2310,9 @@ class App(tk.Tk):
                         core.process_image(j["path"], on_image=self._make_cb("_tool"))
                     ok += 1
                 except Exception:
-                    fails.append(bname)
+                    _tb = traceback.format_exc().strip().splitlines()
+                    _why = _tb[-1] if _tb else "未知错误"
+                    fails.append(f"{bname}: {_why}")
         self.q.put(("done", ok, total, fails))
 
     def _set_running(self, on):
@@ -1803,6 +2322,7 @@ class App(tk.Tk):
                   self.btn_roi_run, self.btn_roi_clear):
             b.configure(state=state)
         self.combo.configure(state="disabled" if on else "readonly")
+        self.lst_files.configure(state="disabled" if on else "normal")
 
     # ===================================================================
     # 第三列统计分析视图
@@ -1817,40 +2337,93 @@ class App(tk.Tk):
             return f"{v:.3f}"
         return f"{v:.3f}"
 
-    def _refresh_stats_view(self):
-        stem = self._last_stem
+    def _refresh_stats_kind(self, kind):
+        """kind: 'tool'(自动) 或 'user'(人工)，各自读取磁盘统计并填充自己的面板。"""
+        stem = os.path.splitext(os.path.basename(self._last_img_name or ""))[0]
+        blk = self._stat_blocks[kind]
+        var = blk["var"]
         if not stem:
-            self.var_stat_title.set("尚未分析图像")
+            var.set("尚未分析图像")
+            self._last_stat_src[kind] = None
             return
-        out_dir = core.INPUT_DIR if not core.OUTPUT_SUBDIR \
-            else os.path.join(core.INPUT_DIR, stem)
-        tag = self._last_out_tag or "_tool"
-        nm_txt = os.path.join(out_dir, f"{stem}{tag}_boundaries_nm.txt")
-        if not os.path.isfile(nm_txt):
-            self.var_stat_title.set(f"{stem}: 未找到 {os.path.basename(nm_txt)}")
+        base = self._folder()
+        out_dir = base if not core.OUTPUT_SUBDIR else os.path.join(base, stem)
+        if kind == "tool":
+            cand = ["_tool"]
+            src_name = "工具自动"
+        else:
+            tag = getattr(self, "_last_manual_tag", None) or "_user"
+            # 人工侧统一读 _user 结果
+            cand = ["_user"] if tag != "_tool" else ["_tool"]
+            src_name = "人工"
+        nm_txt = None
+        for t in cand:
+            p = os.path.join(out_dir, f"{stem}{t}_boundaries_nm.txt")
+            if os.path.isfile(p):
+                nm_txt = p
+                break
+        if not nm_txt:
+            self._last_stat_src[kind] = None
+            var.set(f"{stem}: 尚无{src_name}统计")
             return
         try:
             data = core.analyze_boundaries_file(nm_txt)
-            self._populate_stats_tree(data)
-            src = "框选套索" if tag == "_user" else "工具自动"
-            self.var_stat_title.set(f"当前：{stem}（{src}）  ← {os.path.basename(nm_txt)}")
+            self._populate_stats_tree(kind, data)
+            self._last_stat_src[kind] = nm_txt
+            var.set(f"当前：{stem}（{src_name}）  ← {os.path.basename(nm_txt)}")
         except Exception as e:
-            self.var_stat_title.set(f"统计表读取失败：{e}")
+            self._last_stat_src[kind] = None
+            var.set(f"统计表读取失败：{e}")
 
-    def _populate_stats_tree(self, data):
-        self.tree.delete(*self.tree.get_children())
+    def _fit_right_to_content(self, min_right=460, max_right=820):
+        """统计列数太多时，优先向右扩大窗口，而不是挤压中间图像列。"""
+        if not getattr(self, "_right_frame", None):
+            return
+        self.update_idletasks()
+        right = self._right_frame
+        try:
+            # 上下两块树中较宽者的实际需求（列宽 + 滚动条/边距余量）
+            tree_req = 0
+            for _t in getattr(self, "_stats_trees", {}).values():
+                tree_req = max(tree_req, _t.winfo_reqwidth())
+        except Exception:
+            return
+        desired = max(min_right, tree_req + 34)
+        desired = min(desired, max_right)
+        cur = right.winfo_width()
+        if desired <= cur:
+            return
+        delta = desired - cur
+        # 通过扩大窗口来“向右扩”，而不是占用中列空间
+        scr_w = self.winfo_screenwidth()
+        x = self.winfo_x()
+        y = self.winfo_y()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if x + w + delta > scr_w - 10:       # 防止超出屏幕右边缘
+            delta = max(0, scr_w - 10 - (x + w))
+            desired = cur + delta
+            if delta <= 0:
+                return
+        right.configure(width=desired)
+        self.geometry(f"{w + delta}x{h}+{x}+{y}")
+
+    def _populate_stats_tree(self, kind, data):
+        blk = self._stat_blocks[kind]
+        tree, var = blk["tree"], blk["var"]
+        tree.delete(*tree.get_children())
         cols, descs, rows, means = data["cols"], data["desc"], data["rows"], data["means"]
         if not cols:
-            self.var_stat_title.set("没有识别到 PR 柱，无统计")
+            var.set("没有识别到 PR 柱，无统计")
             return
         col_ids = [f"p{i}" for i in range(len(cols))] + ["avg"]
-        self.tree.configure(columns=col_ids)
+        tree.configure(columns=col_ids)
         for cid, label in zip(col_ids[:-1], cols):
-            self.tree.heading(cid, text=label)
-            self.tree.column(cid, width=66, minwidth=58, anchor="e", stretch=False)
-        self.tree.heading("avg", text="全部柱平均")
-        self.tree.column("avg", width=88, minwidth=80, anchor="e", stretch=False)
-        self.tree.heading("#0", text="计算项")
+            tree.heading(cid, text=label)
+            tree.column(cid, width=66, minwidth=58, anchor="e", stretch=False)
+        tree.heading("avg", text="全部柱平均")
+        tree.column("avg", width=88, minwidth=80, anchor="e", stretch=False)
+        tree.heading("#0", text="计算项")
 
         groups = [
             ("尺寸与 CD（nm）", (0, 4)),
@@ -1860,42 +2433,77 @@ class App(tk.Tk):
         ]
         toggle = 0
         for gname, (s, e) in groups:
-            pid = self.tree.insert("", "end", text=gname, values=[""] * len(col_ids),
-                                   tags=("cat",))
+            pid = tree.insert("", "end", text=gname, values=[""] * len(col_ids),
+                              tags=("cat",))
             for idx in range(s, e):
                 vals = [self._fmt_stat(descs[idx], v) for v in rows[idx]]
                 vals.append(self._fmt_stat(descs[idx], means[idx]))
                 tag = ("odd",) if toggle % 2 else ()
                 toggle += 1
-                self.tree.insert(pid, "end", text=descs[idx], values=vals, tags=tag)
+                tree.insert(pid, "end", text=descs[idx], values=vals, tags=tag)
             toggle += 1
+        self._fit_right_to_content()
 
     # ===================================================================
     # 帮助窗口
     # ===================================================================
     def _show_params_help(self):
-        lines = ["可调节参数与默认值：\n"]
+        lines = [
+            "软件是怎么找柱子的？（看懂这一小段，参数就好理解了）\n"
+            "  ① 把“像柱子的亮块”从背景里挑出来 —— 由【二值化阈值】决定多亮算柱子；\n"
+            "  ② 给亮块“补洞、修毛边” —— 由【闭运算核】控制补修力度；\n"
+            "  ③ 沿水平方向把剖面压扁，在亮度跌下去的“山谷”处把挨在一起的柱子逐根切开\n"
+            "     —— 由【投影平滑核】与【谷值比例】控制切几根、怎么切；\n"
+            "  ④ 丢掉“矮的 / 窄的 / 扁的”杂物 —— 由【最小柱高 / 最小平均宽 / 最小高宽比】过滤；\n"
+            "  ⑤ 贴齐柱底、避开图框 —— 由【底部延伸 / 边缘忽略】微调；【窗口外扩】管侧壁追踪。\n\n"
+            "给新图调参的最快路径：\n"
+            "  · 第一件事先填比例尺（若标尺单位不是默认值）；\n"
+            "  · 识别不准时勾选“调试：另存二值化中间图”，对照黑白图确认柱子是否完整、是否粘连；\n"
+            "  · 之后按下面每条的“何时调大/调小”对症调整，一次只动一个参数。\n\n"
+            "────────────────────────────────────────\n"
+            "各参数含义（默认值已按样例调好，多数图可直接用）：\n"
+        ]
         for attr, name, kind, lo, hi, inc in MAIN_PARAMS:
             lines.append(f"■ {name}  [{attr}]\n"
-                         f"   类型={kind}，默认 {getattr(core, attr)}，范围 {lo}~{hi}，步长 {inc}\n"
+                         f"   默认 {getattr(core, attr)}，可调范围 {lo}~{hi}，步长 {inc}\n"
                          f"   {PARAM_DESC.get(attr, '')}\n")
         lines.append(f"■ 比例尺换算（SCALE_PIXELS / SCALE_NM）\n"
                      f"   默认 {core.SCALE_PIXELS} px 对应 {core.SCALE_NM} nm → "
                      f"1 px = {core.SCALE_NM / core.SCALE_PIXELS:.4f} nm。\n"
-                     f"   只影响 nm 版结果图坐标轴刻度、boundaries_nm / stats_nm 的数值。\n\n"
+                     f"   只影响 nm 版结果图坐标轴刻度、boundaries_nm / stats_nm 的数值，不影响找柱子。\n\n"
                      f"■ 输出方式\n"
                      f"   · 输出到“同名子文件夹”：每张 tif 的结果放进其同名子文件夹。\n"
-                     f"   · 调试中间图：把二值化结果另存一张 png，便于确认阈值。\n")
+                     f"   · 调试中间图：把二值化结果另存一张 png，便于确认阈值。\n"
+                     f"   · 两类结果互不覆盖：_tool（自动整图）、_user（框选套索）。\n")
         self._show_doc("调节参数含义", "".join(lines))
 
     def _show_about(self):
-        self._show_doc("关于", "PR 柱子自动识别与测量工具\n\n"
-                        "第二列两种工具（原始图左上单选）：\n"
-                        "  框选区域  — 左键拖出矩形 → 点“▶ 套索分析所选区域”在框内自动定位 PR 柱；\n"
-                        "  直线量测  — 依次单击 A、B 两点，量测直线像素长度（并按比例尺换算 nm）。\n\n"
-                        "输出文件按来源区分：工具自动整图分析 = _tool，用户框选套索分析 = _user。\n\n"
-                        "本文件是单文件版：分析核心已内置，不依赖其他 .py，\n"
-                        "直接 python pr2_gui.py 运行，或用 PyInstaller 只打包本文件即可。")
+        text = ("PR 柱子自动识别与测量工具\n"
+                "作者：E924744 Kang An\n\n"
+                "版本更新说明：\n"
+                "· 自动整图识别 + 左侧参数实时改动后自动重识别\n"
+                "· 框选套索（_user）人工识别\n"
+                "· 直线量测、角度量测，接近水平/竖直时自动磁吸\n"
+                "· 双路预览 + 右侧上下两块统计表，可分别保存\n"
+                "· 已分析文件列表支持继续编辑\n"
+                "· “打开输出文件夹”直接打开输出文件夹位置\n\n"
+                "第二列三个工具（原始图上单选，自动带水平/竖直磁吸）：\n"
+                "  直线量测  — 单击 A、B 两点，量测直线像素长度并按比例尺换算 nm；\n"
+                "              拖动时连线接近水平或竖直会自动“吸住”，便于对准柱壁/基底；\n"
+                "  角度量测  — 依次单击 A端点 → 顶点V → C端点 三个点，显示夹角与两边长度；\n"
+                "  框选区域  — 左键拖出矩形 → 点“▶ 套索分析所选区域”在框内自动定位 PR 柱。\n\n"
+                "预览与统计分两路：\n"
+                "  工具自动识别 = _tool（左列改参数后自动实时重识别）；\n"
+                "  人工识别 = _user（框选套索，点上方“▶ 套索分析所选区域”生成）。\n"
+                "下方双预览各自带“保存本图识别结果”按钮；第三列上下两块统计表各有“保存该统计表另存为”按钮；\n"
+                "左列下方“已分析文件”单击可载入该图预览并继续操作（批量识别会全部列入）。\n\n"
+                "本文件是单文件版：分析核心已内置，不依赖其他 .py，\n"
+                "直接 python pr2_gui.py 运行，或用 PyInstaller 只打包本文件即可。")
+        box = self._show_doc("关于", text)
+        box.configure(state="normal")
+        box.tag_add("author", "2.0", "2.end+1c")
+        box.tag_configure("author", font=("Microsoft YaHei UI", 12, "bold"))
+        box.configure(state="disabled")
 
     def _show_doc(self, title, text):
         win = tk.Toplevel(self)
@@ -1916,6 +2524,7 @@ class App(tk.Tk):
         box.insert("1.0", text)
         box.configure(state="disabled")
         ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+        return box
 
     # ===================================================================
     # 队列事件
@@ -1933,9 +2542,8 @@ class App(tk.Tk):
                     self.pbar.configure(maximum=total, value=i)
                     self.lbl_pct.configure(text=f"{int(i * 100 / total)}%")
                 elif kind == "img":
-                    _, orig, paint, name = item
-                    self._set_preview(orig, paint, name)
-                    self._refresh_stats_view()
+                    _, tag, orig, paint, name = item
+                    self._set_preview(tag, orig, paint, name)
                 elif kind == "done":
                     _, ok, total, fails = item
                     self._set_running(False)
@@ -1981,28 +2589,28 @@ def main():
         probe = os.environ.get("PR_PROBE_IMG", "pr2.tif")
         lines = [f"numpy={np.__version__}  cv2={cv2.__version__}", f"cwd={os.getcwd()}"]
         try:
-            if os.path.isfile(probe):
+            if not os.path.isfile(probe):
+                lines.append(f"probe image not found: {probe}（跳过算法自检）")
+            else:
                 img, binary = core.preprocess_image(probe)
                 lines.append(f"preprocess ok: shape={img.shape}")
-            else:
-                lines.append(f"probe image not found: {probe}")
-            cols, _ = core._detect_columns(img, binary)
-            for i, c in enumerate(cols, 1):
-                c['label'] = i
-                c['color'] = core.PR_COLORS[(i - 1) % len(core.PR_COLORS)]
-            main_img = core.render_main_image(img, cols, nm_per_px=1.0)
-            lines.append(f"render_main_image ok: main={main_img.shape} n_col={len(cols)}")
-            got = {}
-            core.process_image(probe, on_image=lambda o, m, n: got.update(img=o.shape, main=m.shape, name=n))
-            lines.append(f"process_image on_image ok: {got}")
-            # ROI 框内套索链路自检（用图像中部区域）
-            core.process_image_roi(probe, (60, 110, 600, 350),
-                                   on_image=lambda o, m, n: got.update(roi=(o.shape, m.shape)))
-            lines.append(f"process_image_roi ok: {got}")
-            if os.path.isfile("pr2/pr2_tool_boundaries_nm.txt"):
-                st = core.analyze_boundaries_file("pr2/pr2_tool_boundaries_nm.txt")
-                lines.append(f"analyze ok: cols={st['cols']} n_items={len(st['rows'])} "
-                             f"means[0]={st['means'][0]}")
+                cols, _ = core._detect_columns(img, binary)
+                for i, c in enumerate(cols, 1):
+                    c['label'] = i
+                    c['color'] = core.PR_COLORS[(i - 1) % len(core.PR_COLORS)]
+                main_img = core.render_main_image(img, cols, nm_per_px=1.0)
+                lines.append(f"render_main_image ok: main={main_img.shape} n_col={len(cols)}")
+                got = {}
+                core.process_image(probe, on_image=lambda o, m, n: got.update(img=o.shape, main=m.shape, name=n))
+                lines.append(f"process_image on_image ok: {got}")
+                # ROI 框内套索链路自检（用图像中部区域）
+                core.process_image_roi(probe, (60, 110, 600, 350),
+                                       on_image=lambda o, m, n: got.update(roi=(o.shape, m.shape)))
+                lines.append(f"process_image_roi ok: {got}")
+                if os.path.isfile("pr2/pr2_tool_boundaries_nm.txt"):
+                    st = core.analyze_boundaries_file("pr2/pr2_tool_boundaries_nm.txt")
+                    lines.append(f"analyze ok: cols={st['cols']} n_items={len(st['rows'])} "
+                                 f"means[0]={st['means'][0]}")
         except Exception as e:
             lines.append(f"FAILED: {e}")
         if getattr(sys, "frozen", False):
