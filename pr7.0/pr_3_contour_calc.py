@@ -836,8 +836,21 @@ def contour_morphology(y, left, right, valid_left=None, valid_right=None, cd_mod
         out["t_top_nm"] = positive_q90((width - base)[top])
         out["footing_nm"] = positive_q90((width - base)[bottom])
         out["undercut_nm"] = positive_q90((base - width)[bottom])
-        out["middle_thick_nm"] = positive_q90((width - base)[middle])
-        out["middle_thin_nm"] = positive_q90((base - width)[middle])
+        # 中间细/粗（v7.5.0）：除"中段相对标准 CD"外，中间细再取"中段相对
+        # 底部宽"的对比——人工判断中间细看的是柱身比柱脚细（锥形柱，A4CD536
+        # 中段 8.72 vs 底部 10.46、A52Q193 19.51 vs 23.34）；仅用众数 CD 作
+        # 基准时这类信号幅度过小（0.1nm 级）会漏报。
+        # 不把"中段-顶部"对比计入中间粗：SEM 圆头柱顶部天然窄于柱身
+        # （A4BY067 2.8nm、A63Q162 系 5nm+），会把正常圆顶柱误报为中间粗。
+        thin_cd = positive_q90((base - width)[middle])
+        thick_cd = positive_q90((width - base)[middle])
+        w_mid = float(np.median(width[middle])) if np.any(middle) else None
+        thin_side = 0.0
+        if w_mid is not None and np.any(bottom):
+            w_bot = float(np.median(width[bottom]))
+            thin_side = max(0.0, w_bot - w_mid)
+        out["middle_thin_nm"] = max(thin_cd, thin_side)
+        out["middle_thick_nm"] = thick_cd
         out["top_deficit_nm"] = positive_q90((base - width)[cap])
         cap_deficit = np.maximum(0.0, base - width[cap])
         _trap = getattr(np, "trapezoid", None) or np.trapz
@@ -968,6 +981,13 @@ def classify_profile_multi(metrics, shape_thr=None, wave_thr=None):
         ratio_k = MORPH_SHAPE_CD_RATIO_BY_KEY.get(k)
         if ratio_k and _finite_number(cd) and cd > 0:
             thr_k = max(thr_k, float(ratio_k) * float(cd))
+        if (k in ("middle_thin", "middle_thick") and _finite_number(cd) and cd > 0
+                and "footing" in MORPH_SHAPE_CD_RATIO_BY_KEY):
+            # 中间细/粗的"中段 vs 底部/顶部"对比是结构性信号，不随行噪声缩放；
+            # σ 自适应项会把小柱图的真实中间细卡掉（A4CD536 1.73 vs σ 项 2.14）。
+            # 门槛改用 下限 + 与 footing 同级的 CD 比例。
+            thr_k = max(MORPH_SHAPE_FLOOR_NM,
+                        float(MORPH_SHAPE_CD_RATIO_BY_KEY["footing"]) * float(cd))
         if value >= thr_k:
             labels.append(k)
         if len(labels) >= 2:
