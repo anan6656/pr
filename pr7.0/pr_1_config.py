@@ -23,7 +23,7 @@ for _env_name in (
 ):
     os.environ.setdefault(_env_name, "1")
 
-APP_VERSION = "7.0.1"
+APP_VERSION = "7.1.0"
 APP_TITLE = f"PR profile analyzer v{APP_VERSION}"
 EXE_NAME = f"PR_profile_analyzer_v{APP_VERSION}"
 
@@ -152,8 +152,6 @@ MORPHOMETRY = [
     ("ler_right_nm", "右侧 LER 3σ", "nm"),
     ("ler_nm", "两侧平均 LER 3σ", "nm"),
     ("lwr_nm", "LWR 3σ", "nm"),
-    ("wave_amplitude_nm", "周期起伏：单边平均幅值", "nm"),
-    ("wave_period_nm", "周期起伏：主周期", "nm"),
 ]
 # 六类几何形貌（互斥分类用，基准线为众数 CD）；LER/LWR 不参与互斥分类，单独统计。
 MORPH_SHAPES = [
@@ -161,8 +159,7 @@ MORPH_SHAPES = [
     ("middle_thick_nm", "中间粗"), ("middle_thin_nm", "中间细"),
     ("footing_nm", "Footing"), ("undercut_nm", "Undercut"),
 ]
-ROUGHNESS_KEYS = {"ler_left_nm", "ler_right_nm", "ler_nm", "lwr_nm",
-                  "wave_amplitude_nm", "wave_period_nm"}
+ROUGHNESS_KEYS = {"ler_left_nm", "ler_right_nm", "ler_nm", "lwr_nm"}
 PROFILE_SAMPLES = 401
 
 # ---- v6.3 互斥分类：CD 众数基准与自适应阈值（v6.4 起阈值带上限）----
@@ -170,12 +167,8 @@ MORPH_MODE_BIN_MIN_NM = 0.5     # 众数分箱最小 bin 宽 (nm)
 MORPH_MODE_BIN_RATIO = 0.05     # bin 宽 = max(下限, 该比例 × (P95-P10))
 MORPH_MODE_FLAT_FACTOR = 1.5    # 众数峰计数 < 该倍数 × 中位 bin 计数 → 视为平坦，回退中位数
 MORPH_NOISE_K = 4.0             # 形貌阈值系数：shape_thr = max(下限, min(K × σ_noise, 上限))
-MORPH_WAVE_K = 6.0              # 驻波阈值系数：wave_thr = max(下限, min(K × σ_noise, 上限))
 MORPH_SHAPE_FLOOR_NM = 1.0      # 形貌阈值下限 (nm)，与旧 1nm 统计口径一致
 MORPH_SHAPE_CAP_NM = 6.0        # 形貌阈值上限 (nm)：σ 自适应封顶，防高噪声图漏报形貌
-MORPH_WAVE_FLOOR_NM = 5.0       # 驻波 LER/LWR 阈值下限 (nm)
-MORPH_WAVE_CAP_NM = 10.0        # 驻波阈值上限 (nm)：σ 自适应封顶
-MORPH_WAVE_AMP_FLOOR_NM = 1.0   # 驻波周期幅值下限 (nm)：LER 偏大且 FFT 周期幅值显著才判驻波
 MORPH_SHAPE_CD_RATIO = 0.10     # 形状阈值 CD 归一化：生效阈值 = max(σ自适应阈值, 比例×CD)
 # 各类形貌的单独 CD 比例门槛（缺省用 MORPH_SHAPE_CD_RATIO）。
 # 依据 grey_images 人工标注集标定：正常圆顶柱的顶部圆化、正常柱的锥形底部
@@ -195,11 +188,13 @@ BOTTOM_PULL_WEAK = 0.3          # 底边弱证据二次搜索的向下粘滞先�
 RESULT_BANNER_H = 34            # 结果图顶部分类横幅条高度 (px)：扩展画布，不覆盖原图
 TOP_RESCUE_PULL = 0.35          # 顶边弱证据二次搜索的向上粘滞先验（仅 binary_fallback 触发）
 TOP_RESCUE_GATE = 0.85          # 顶边二次搜索采纳门：新路径中位强度 ≥ 该倍数 × 原路径
-ENABLE_LER_OUTLIER_FLAG = True  # 柱数≥10 时对 LER 显著离群柱加"疑似驻波离群"旗标
+ENABLE_LER_OUTLIER_FLAG = True  # 柱数≥10 时对 LER 显著离群柱加"粗糙度离群"旗标
+# v7.1.0：周期起伏（wave_amplitude_nm / wave_period_nm）与"驻波"分类已移除，
+# 六类几何形貌 + LER/LWR 粗糙度即全部输出指标。
 PROFILE_CLASSES = [
     ("normal", "Normal"), ("top_rounding", "Top-rounding"), ("t_top", "T-top"),
     ("middle_thick", "中间粗"), ("middle_thin", "中间细"),
-    ("footing", "Footing"), ("undercut", "Undercut"), ("standing_wave", "驻波"),
+    ("footing", "Footing"), ("undercut", "Undercut"),
 ]
 # 文件名末尾的人工形貌标注 → 六类/驻波 key（用于带标注样本集的结果对照）。
 # 取最后一个命中的关键词（形貌词通常写在文件名末尾）。
@@ -213,8 +208,6 @@ GT_KEYWORDS = [
     ("ttop", "t_top"),
     ("top_rounding", "top_rounding"),
     ("toprounding", "top_rounding"),
-    ("驻波", "standing_wave"),
-    ("standing_wave", "standing_wave"),
 ]
 
 
@@ -307,8 +300,8 @@ v6.5 整图多标签+星级：整图（平均轮廓）分类在互斥主标签�
 柱间差异与低频形貌不进入该估计；无纳入柱时阈值取下限。
 LER：中间 15~85% 侧壁 x(y) 去线性趋势后的 3σ，左右分别计算；LWR 对同一高度段的 R(y)-L(y) 去线性趋势后计算 3σ。
 粗糙度主比较取逐柱原始采样测量值的均值，另存平均坐标轮廓的粗糙度，避免平均时互相抵消。
-周期起伏：中间侧壁去二次趋势、Hann 窗频谱找至少 2 周期且每周期至少 4 个采样点的主峰；主峰邻域能量占比≥45% 后拟合正弦幅值。
-周期起伏是图像中的周期成分，不等同于已证实的光学驻波；无显著周期时幅值为 0，周期留空。
+v7.1.0 起不再计算周期起伏（幅值/周期）与驻波分类：该量由侧壁频谱拟合得到，受单包络
+形貌与噪声影响大，不作为形貌判据；粗糙度只保留 LER/LWR 3σ。
 形貌出现数量以量值≥形状阈值计数（JSON 字段沿用 above_1nm 旧名），仅作统一统计阈值；所有原始数值（含 0）均导出。
 检测触及图像/ROI 边界的残柱仍显示逐柱值和截断提示，但不参与平均形貌 baseline；无完整柱时禁止比较。
 比例尺来自用户输入，跨图比较可分别设置 nm/px；滤波、像素尺寸和测量长度会影响粗糙度，结果未作噪声去偏。
@@ -467,7 +460,7 @@ r_eq=sqrt(max(0,A)/(2(1−π/4)))。两侧相等理想圆角的缺失面积各�
 Undercut 与 Footing 同区间互斥，两者均超阈值时只报量值大者（主导形貌）。
 各项量值是左右边界合计的宽度差，不是单侧突出距离。
 
-## 5  LER / LWR 与周期起伏
+## 5  LER / LWR
 只考察主体0.15≤z≤0.85。左LER仅取左valid=1；右LER仅取右valid=1；
 LWR要求同一行左右均valid=1。每项至少8个有效点，且有效数≥该主体总点数的70%，否则为空。
 对每项 v=X_L、X_R 或 W，以其有效 Y 做一次最小二乘去趋势 v=a+bY，残差 e_i=v_i−a−bY_i。
@@ -476,14 +469,7 @@ LER_L=3σ(e_L)，LER_R=3σ(e_R)，LER=(LER_L+LER_R)/2；任一侧缺失时平均
 LWR=3σ(e_W)。左右边缘的相关性会影响 LWR，它不等于两侧LER之和。
 软件没有噪声去偏，滤波和测量长度也影响数值。
 
-周期起伏为辅助量，不是已证实的光学驻波。主体左右所有点均须有效，且至少24个采样点。
-先对左右 X(Y) 去二次趋势，残差 e_L/e_R；Hann窗 w_i=0.5−0.5cos(2πi/(n−1))。
-P_k=|rFFT(w·e_L)_k|²+|rFFT(w·e_R)_k|²，采样间隔 d=median(Y_(i+1)−Y_i)，f_k=k/(nd)。
-仅在 2/(Y_last−Y_first)≤f≤1/(4d) 内选最大P主峰 k*（至少2周期、每周期至少4点）。
-C=(P_(k*−1)+P_k*+P_(k*+1))/Σ_(k≥1)P_k，边界按已有频率截断。
-可选频段总能量<10⁻¹²或C<0.45，输出幅值0、周期空；采样不足/存在缺口则两项均空。
-峰通过后，对左右原始坐标分别拟合 X=a+bt+ct²+u·sin(φ)+v·cos(φ)，
-t=(Y−mean(Y))/(Y_last−Y_first)，φ=2πf_k*(Y−Y_first)。
+（v7.1.0 起已删除周期起伏/驻波：不再做侧壁频谱拟合，无幅值与周期输出。）
 单边幅值 A_L/R=sqrt(u²+v²)，报告 A=(A_L+A_R)/2，周期 T=1/f_k*（nm）。
 幅值是正弦单边振幅，不是峰峰值；频率受当前采样长度的 FFT 分辨率限制。
 

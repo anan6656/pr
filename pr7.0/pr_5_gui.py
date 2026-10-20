@@ -398,7 +398,7 @@ class BaselineWindow(tk.Toplevel):
                     counts = sample.get("classification_counts") or {}
                     counts_txt = "、".join(f"{k}×{v}" for k, v in counts.items()) if counts else ""
                     thr = sample.get("thresholds") or {}
-                    thr_txt = f"，阈值 形状≥{thr.get('shape', '-'):.2f}/驻波≥{thr.get('wave', '-'):.2f}nm"
+                    thr_txt = f"，阈值 形状≥{thr.get('shape', '-'):.2f}nm"
                     if thr:
                         cd_m = thr.get('cd_mode')
                         if cd_m:
@@ -3338,7 +3338,7 @@ class App(tk.Tk):
             cd_part = (f"；生效阈值=max(形状, {thresholds.get('shape_cd_ratio', 0.1):.0%}×CD={cd_m:.2f})"
                        if cd_m else "")
             tree.insert("", "end", text="分类阈值 (nm)",
-                        values=[f"形状≥{thresholds.get('shape', 0):.2f} / 驻波≥{thresholds.get('wave', 0):.2f}（σ_noise={sigma_txt}）{cd_part}"],
+                        values=[f"形状≥{thresholds.get('shape', 0):.2f}（σ_noise={sigma_txt}）{cd_part}"],
                         tags=("profile",))
 
     # -----------------------------------------------------------------

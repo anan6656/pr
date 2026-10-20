@@ -2094,7 +2094,7 @@ def _extend_rows_checked(rows, gray, new_foot_y):
         if y >= h:
             break
         m = float(np.median(g[y, fl + 1:fr]))
-        if abs(m - base) > 12.0:
+        if abs(m - base) > 25.0:
             break
         if sub is not None and abs(m - sub) < 8.0:
             break
@@ -2102,6 +2102,255 @@ def _extend_rows_checked(rows, gray, new_foot_y):
     if len(out) == len(rows):
         return None
     return out
+
+
+def _fill_row_gaps(cols, max_gap_ratio=0.20, min_gap=4):
+    """断行填补（v7.1.0）：柱体纵向应连续，追踪中途丢失的行按邻行线性插值补齐。
+
+    几何行追踪在柱身对比度局部降低时会丢行，ranges 出现 y 跳跃，表现为
+    "柱子中间断开"（A671318-01M-4）。此处按跳跃跨度做线性插值补齐；
+    缺口超过 max(4, 20%×柱高) 视为真实结构中断，不补。
+    """
+    for c in cols:
+        rows = c.get("ranges")
+        if not rows or len(rows) < 4:
+            continue
+        try:
+            arr = [(float(r[0]), float(r[1]), float(r[2])) for r in rows]
+        except Exception:
+            continue
+        height = arr[-1][0] - arr[0][0] + 1
+        limit = max(int(min_gap), int(round(max_gap_ratio * height)))
+        out = [arr[0]]
+        filled = 0
+        for i in range(len(arr) - 1):
+            y0, l0, r0 = arr[i]
+            y1, l1, r1 = arr[i + 1]
+            step = int(round(y1)) - int(round(y0))
+            if 1 < step <= limit:
+                for k in range(1, step):
+                    t = float(k) / float(step)
+                    out.append((y0 + k, l0 + (l1 - l0) * t, r0 + (r1 - r0) * t))
+                filled += step - 1
+            out.append(arr[i + 1])
+        if filled:
+            c["ranges"] = out
+            c["contour"] = build_contour(out)
+            c["gap_filled"] = filled
+    return cols
+
+
+def _merge_fragment_columns(cols, gray=None, width_ratio=0.45, max_gap=3):
+    """碎片柱合并（v7.1.0）。
+
+    柱体对比度局部降低时追踪会把一根柱切成若干窄条（A671318-01M-4 出现
+    2~4px 宽的碎片，表现为"柱子中间断开"）。宽度 < ratio×柱群中位宽、且与
+    邻柱几乎无间隙的窄条并入最近的邻柱：x 取并集、y 取包络、逐行取外沿。
+    """
+    if len(cols) < 2:
+        return cols
+    widths = sorted(float(c["right"] - c["left"] + 1) for c in cols)
+    med_w = widths[len(widths) // 2]
+    if med_w <= 0:
+        return cols
+
+    def _rows_map(c):
+        return {int(r[0]): (float(r[1]), float(r[2])) for r in c.get("ranges", [])}
+
+    changed = True
+    guard = 0
+    while changed and guard < 4:
+        changed, guard = False, guard + 1
+        cols = sorted(cols, key=lambda c: c["center_x"])
+        out = []
+        for c in cols:
+            w = float(c["right"] - c["left"] + 1)
+            if not out or w >= width_ratio * med_w:
+                out.append(c)
+                continue
+            prev = out[-1]
+            gap = float(c["left"]) - float(prev["right"])
+            if gap > max_gap:
+                out.append(c)
+                continue
+            # 合并：y 包络 + 逐行取外沿
+            m1, m2 = _rows_map(prev), _rows_map(c)
+            ys = sorted(set(m1) | set(m2))
+            rows = []
+            for y in ys:
+                a1, b1 = m1.get(y, (None, None))
+                a2, b2 = m2.get(y, (None, None))
+                vals_a = [v for v in (a1, a2) if v is not None]
+                vals_b = [v for v in (b1, b2) if v is not None]
+                if not vals_a or not vals_b:
+                    continue
+                rows.append((y, min(vals_a), max(vals_b)))
+            if len(rows) < 4:
+                out.append(c)
+                continue
+            prev["ranges"] = rows
+            prev["left"] = int(min(r[1] for r in rows))
+            prev["right"] = int(max(r[2] for r in rows))
+            prev["y_top"] = int(rows[0][0])
+            prev["y_bottom"] = int(rows[-1][0])
+            prev["center_x"] = 0.5 * (prev["left"] + prev["right"])
+            prev["contour"] = build_contour(rows)
+            prev["merged_fragment"] = True
+            changed = True
+        cols = out
+    return cols
+
+
+def _split_wide_columns_by_seam(cols, gray, width_factor=1.7, min_contrast=8.0):
+    """宽柱暗缝拆分（v7.1.0）。
+
+    相邻柱粘连时会被追踪成一根宽柱（A671318-01M-2 出现 93~106px 宽柱，
+    而柱群中位约 35px）。宽度 > factor×中位宽的柱，在其 x 区间内沿柱高统计
+    列中位灰度，寻找纵向暗缝（两侧为柱体、缝内明显变暗且缝宽 2~10px），
+    在缝中心把柱一分为二。找不到可靠暗缝则保持原样。
+    """
+    if gray is None or len(cols) < 2:
+        return cols
+    g = np.asarray(gray, dtype=np.float32)
+    h = g.shape[0]
+    widths = sorted(float(c["right"] - c["left"] + 1) for c in cols)
+    med_w = widths[len(widths) // 2]
+    if med_w <= 0:
+        return cols
+    out = []
+    for c in cols:
+        L, R = int(c["left"]), int(c["right"])
+        w = R - L + 1
+        y0, y1 = int(c["y_top"]), int(c["y_bottom"])
+        if w <= width_factor * med_w or y1 - y0 < 8:
+            out.append(c)
+            continue
+        ys0, ys1 = max(0, y0 + 1), min(h - 1, y1)
+        if ys1 <= ys0:
+            out.append(c)
+            continue
+        # 列剖面：沿柱高的中位灰度（暗缝在该剖面上是局部低谷）
+        prof = np.median(g[ys0:ys1 + 1, L:R + 1], axis=0)
+        if prof.size < 8:
+            out.append(c)
+            continue
+        body = float(np.median(prof))
+        sm = cv2.GaussianBlur(prof.reshape(1, -1), (1, 5), 0).ravel() if prof.size >= 5 else prof
+        # 峰（柱体）之间找最深谷，谷两侧要有柱体亮峰
+        peaks = [i for i in range(1, len(sm) - 1)
+                 if sm[i] >= sm[i - 1] and sm[i] >= sm[i + 1] and sm[i] > body]
+        if len(peaks) < 2:
+            out.append(c)
+            continue
+        best = None
+        for i in range(len(peaks) - 1):
+            a, b = peaks[i], peaks[i + 1]
+            if b - a < 4 or b - a > max(10, int(med_w * 0.9)):
+                continue
+            seg = sm[a:b + 1]
+            valley = float(seg.min())
+            depth = min(float(sm[a]), float(sm[b])) - valley
+            if depth < min_contrast:
+                continue
+            if best is None or depth > best[0]:
+                best = (depth, a + int(np.argmin(seg)))
+        if best is None:
+            out.append(c)
+            continue
+        seam = L + best[1]
+        if seam - L < 3 or R - seam < 3:
+            out.append(c)
+            continue
+        rows = [(float(r[0]), float(r[1]), float(r[2])) for r in c.get("ranges", [])]
+        left_rows = [(y, a, min(b, float(seam))) for y, a, b in rows if b > a]
+        right_rows = [(y, max(a, float(seam) + 1), b) for y, a, b in rows if b > a]
+        left_rows = [r for r in left_rows if r[2] - r[1] >= 2]
+        right_rows = [r for r in right_rows if r[2] - r[1] >= 2]
+        if len(left_rows) < 4 or len(right_rows) < 4:
+            out.append(c)
+            continue
+        for idx, sub in enumerate((left_rows, right_rows)):
+            nc = dict(c)
+            nc["ranges"] = sub
+            nc["left"] = int(min(r[1] for r in sub))
+            nc["right"] = int(max(r[2] for r in sub))
+            nc["y_top"] = int(sub[0][0])
+            nc["y_bottom"] = int(sub[-1][0])
+            nc["center_x"] = 0.5 * (nc["left"] + nc["right"])
+            nc["contour"] = build_contour(sub)
+            nc["split_from_wide"] = True
+            nc.pop("ranges_subpix", None)
+            out.append(nc)
+    return sorted(out, key=lambda c: c["center_x"])
+
+
+def _drop_structurally_invalid(cols, gray, max_h_ratio=0.40, max_width_cv=0.40):
+    """无效结构剔除（v7.1.0，针对 A575082 via 单孔）。
+
+    PR 柱阵的高度不超过图像高度的约 40%，且柱身宽度沿高度不应剧烈变化。
+    同时满足"过高（>40% 图高）+ 宽度 CV 大（>0.40）"的"柱"实际是把衬底或
+    通孔长结构误当柱（A575082：9 根柱高 222~236px、柱身宽 1~55px 剧变）。
+    若剔除后无柱且原柱数 >1，保留高度最小、宽度 CV 最小的一根
+    （单个通孔的情形）。
+    """
+    if not cols:
+        return cols
+    g = np.asarray(gray) if gray is not None else None
+    h = int(g.shape[0]) if g is not None else 0
+    if h <= 0:
+        return cols
+    keep, dropped = [], []
+    for c in cols:
+        rr = np.asarray(c.get("ranges", []), dtype=float)
+        if rr.size == 0:
+            continue
+        height = float(rr[-1, 0] - rr[0, 0] + 1)
+        widths = rr[:, 2] - rr[:, 1]
+        wcv = float(widths.std() / max(widths.mean(), 1e-9))
+        if height > max_h_ratio * h:
+            dropped.append((height, wcv, c))
+        else:
+            keep.append(c)
+    if dropped and not keep:
+        dropped.sort(key=lambda t: (t[0], t[1]))
+        keep = [dropped[0][2]]
+    return keep
+
+
+def _align_bottoms_to_consensus(cols, gray):
+    """柱底共识延伸（v7.1.0）：同一排柱的底边应落在同一衬底界面。
+
+    多个收缩守卫（衬底亮带回收、底部离群收缩、梯度脚尾裁剪）叠加时，个别柱
+    底会被提到明显高于同伴的位置（"底部靠上"，A4BY067/A4CD536）。此处把高于
+    柱群共识底边 max(3px, 10%×柱高) 以上的柱底，用 _extend_rows_checked 向
+    下延展到共识位置——该函数自带逐行灰度证据校验，不会拖尾进衬底。
+    """
+    if gray is None or len(cols) < 2:
+        return cols
+    g = np.asarray(gray, dtype=np.float32)
+    h = g.shape[0]
+    valid = [c for c in cols if c.get("ranges") and len(c["ranges"]) >= 4]
+    if len(valid) < 2:
+        return cols
+    bottoms = [int(c["y_bottom"]) for c in valid]
+    heights = [int(c["y_bottom"]) - int(c["y_top"]) for c in valid]
+    med_b = float(np.median(bottoms))
+    med_h = float(np.median(heights)) if heights else 0.0
+    tol = max(3.0, 0.10 * med_h)
+    sane = [b for b in bottoms if b >= med_b - tol]
+    target = float(np.median(sane)) if len(sane) >= 2 else med_b
+    for c in valid:
+        yb = int(c["y_bottom"])
+        if yb >= h - 2 or yb >= target - tol:
+            continue
+        rows = c.get("ranges")
+        new_rows = _extend_rows_checked(rows, g, target)
+        if new_rows and len(new_rows) > len(rows):
+            c["ranges"] = new_rows
+            c["y_bottom"] = int(new_rows[-1][0])
+            c["bottom_source"] = "bottom_consensus_ext"
+            c["contour"] = build_contour(new_rows)
+    return cols
 
 
 def _shrink_bottom_outliers(cols):
@@ -2183,7 +2432,7 @@ def _clip_substrate_band_overreach(cols, gray):
         k0 = cand[0]
         if not all(v >= mn_v + 30.0 for v in below[k0:]):
             continue
-        if len(below) - k0 < 8:
+        if len(below) - k0 < 12:
             continue
         # 收缩 ranges 到谷带末行
         new_rows = [r for r in c["ranges"] if int(r[0]) <= vb]
@@ -3207,6 +3456,15 @@ def _detect_columns(img, binary, aux, roi_mode=False, on_stage=None):
     cols = _clip_substrate_band_overreach(cols, gray)
     # P3.4: 柱底聚集收缩（DEV+ overlay 区柱底下探限制）
     cols = _shrink_bottom_outliers(cols)
+    # v7.1.0: 断行填补（柱体纵向连续性）→ 柱底共识延伸（底边对齐衬底界面），
+    # 修正"柱中间断开"与"底部偏上"；两者都在收缩守卫之后执行。
+    cols = _fill_row_gaps(cols)
+    # v7.1.0: 先按暗缝拆分粘连宽柱，再合并被切碎的窄条碎片柱。
+    cols = _split_wide_columns_by_seam(cols, gray)
+    cols = _merge_fragment_columns(cols, gray)
+    # v7.1.0: 剔除"过高 + 宽窄剧变"的无效结构（误把衬底/通孔长结构当柱）。
+    cols = _drop_structurally_invalid(cols, gray)
+    cols = _align_bottoms_to_consensus(cols, gray)
     # S3 超大柱宽守卫：柱宽 >2×默认精修半径且边缘支持弱（DP 半径封顶
     # 32px 够不到真实侧壁）时，按柱宽比例放大半径对该柱重跑一次精修。
     # 仅当重跑后 edge_support 提高才采纳（防误触 A66 粘连柱——其

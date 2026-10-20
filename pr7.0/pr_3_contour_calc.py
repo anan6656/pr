@@ -29,10 +29,6 @@ from pr_1_config import (
     MORPH_SHAPE_CD_RATIO_BY_KEY,
     MORPH_SHAPE_FLOOR_NM,
     MORPH_TOP_ROUNDING_CD_RATIO,
-    MORPH_WAVE_AMP_FLOOR_NM,
-    MORPH_WAVE_CAP_NM,
-    MORPH_WAVE_FLOOR_NM,
-    MORPH_WAVE_K,
     MORPHOLOGY_DEFINITION,
     MORPHOMETRY,
     MORPH_SHAPES,
@@ -790,30 +786,8 @@ def _row_noise_sigma_nm(y, width):
     return sigma if math.isfinite(sigma) and sigma > 0 else None
 
 
-def _periodic_edge_metrics(y, left, right):
-    if len(y) < 24 or y[-1] <= y[0]:
-        return None, None
-    dt = float(np.median(np.diff(y)))
-    signals = [_detrended(v, y, 2) for v in (left, right)]
-    window = np.hanning(len(y))
-    freq = np.fft.rfftfreq(len(y), dt)
-    power = sum(np.abs(np.fft.rfft(v * window)) ** 2 for v in signals)
-    eligible = (freq >= 2.0 / (y[-1] - y[0])) & (freq <= 1.0 / (4 * dt))
-    if not np.any(eligible) or float(np.sum(power[eligible])) < 1e-12:
-        return 0.0, None
-    candidates = np.where(eligible)[0]
-    peak = int(candidates[np.argmax(power[eligible])])
-    concentration = np.sum(power[max(0, peak - 1):peak + 2]) / max(1e-12, np.sum(power[1:]))
-    if concentration < .45:
-        return 0.0, None
-    phase = 2 * np.pi * freq[peak] * (y - y[0])
-    t = (y - y.mean()) / max(1e-9, np.ptp(y))
-    design = np.column_stack((np.ones(len(y)), t, t*t, np.sin(phase), np.cos(phase)))
-    amplitudes = []
-    for values in (left, right):
-        coefs = np.linalg.lstsq(design, values, rcond=None)[0]
-        amplitudes.append(float(np.hypot(coefs[-2], coefs[-1])))
-    return float(np.mean(amplitudes)), float(1.0 / freq[peak])
+# v7.1.0：周期起伏（_periodic_edge_metrics）已删除——侧壁频谱拟合受单包络形貌与
+# 噪声影响大，不做为形貌判据；粗糙度只保留 LER/LWR 3σ。
 
 
 
@@ -929,9 +903,6 @@ def contour_morphology(y, left, right, valid_left=None, valid_right=None, cd_mod
             out[key] = 3.0 * float(np.std(_detrended(values[mask], y[mask])))
     if out["ler_left_nm"] is not None and out["ler_right_nm"] is not None:
         out["ler_nm"] = .5 * (out["ler_left_nm"] + out["ler_right_nm"])
-    # 频谱不跨缺失点插值，避免把缺口伪装为周期信号。
-    if np.all((vl & vr)[body]):
-        out["wave_amplitude_nm"], out["wave_period_nm"] = _periodic_edge_metrics(y[body], left[body], right[body])
     return {key: (0.0 if isinstance(value, float) and abs(value) < 1e-6 else value)
             for key, value in out.items()}
 
@@ -959,9 +930,8 @@ def _profile_rating(margin, eff_thr):
 def classify_profile_multi(metrics, shape_thr=None, wave_thr=None):
     """多标签 + 星级分类（v6.5）。
 
-    标签规则：驻波最高优先（roughness ≥ wave_thr 且 FFT 周期幅值显著），
-    驻波为主标签时六类最大者若也超生效阈值则作第二标签；无驻波时六类
-    量值降序取 ≥ 生效阈值的前两个（最多同时两个 profile），0 个 → Normal。
+    标签规则（v7.1.0：已移除驻波/周期起伏）：六类量值降序取 ≥ 生效阈值的
+    前两个（最多同时两个 profile），0 个 → Normal。
     生效阈值 = max(shape_thr, MORPH_SHAPE_CD_RATIO × CD)，与单标签口径一致。
     星级只评主标签量值 margin：≥3×阈值 ★★★、≥2× ★★、≥1× ★，否则 0。
     返回 dict：label/label_cn/margin/wave/threshold（与单标签字段一致）+
@@ -969,22 +939,6 @@ def classify_profile_multi(metrics, shape_thr=None, wave_thr=None):
     （六类量值降序，报告与调参用）。无法评估时 label=None、labels=[]。
     """
     shape_thr = float(MORPH_SHAPE_FLOOR_NM if shape_thr is None else shape_thr)
-    wave_thr = float(MORPH_WAVE_FLOOR_NM if wave_thr is None else wave_thr)
-    ler = metrics.get("ler_nm")
-    if not _finite_number(ler):
-        sides = [metrics.get("ler_left_nm"), metrics.get("ler_right_nm")]
-        sides = [v for v in sides if _finite_number(v)]
-        ler = float(np.mean(sides)) if sides else None
-    lwr = metrics.get("lwr_nm")
-    wave_amp = metrics.get("wave_amplitude_nm")
-    wave_significant = _finite_number(wave_amp) and wave_amp >= MORPH_WAVE_AMP_FLOOR_NM
-    roughness = None
-    if _finite_number(ler) and _finite_number(lwr):
-        roughness = max(float(ler), float(lwr))
-    elif _finite_number(ler):
-        roughness = float(ler)
-    elif _finite_number(lwr):
-        roughness = float(lwr)
     candidates = [(float(metrics[key]), key, label) for key, label in MORPH_SHAPES
                   if _finite_number(metrics.get(key))]
     if not candidates:
@@ -1005,21 +959,6 @@ def classify_profile_multi(metrics, shape_thr=None, wave_thr=None):
     def _shape_key(raw_key):
         return raw_key[:-len(suffix)] if raw_key.endswith(suffix) else raw_key
 
-    is_wave = roughness is not None and roughness >= wave_thr and wave_significant
-    if is_wave:
-        labels = ["standing_wave"]
-        labels_cn = ["驻波"]
-        # 驻波主标签不参与星级；第二标签取六类最大者（超阈值才作标签）。
-        second_rating = 0
-        if sorted_shapes and sorted_shapes[0][0] >= eff_thr:
-            labels.append(_shape_key(sorted_shapes[0][1]))
-            labels_cn.append(sorted_shapes[0][2])
-            second_rating = 1
-        return {"label": "standing_wave", "label_cn": "驻波",
-                "margin": roughness, "wave": True, "threshold": float(wave_thr),
-                "labels": labels, "labels_cn": labels_cn,
-                "rating": second_rating,
-                "eff_thr": eff_thr, "sorted_shapes": sorted_shapes}
     labels = []
     for value, key, _ in sorted_shapes:
         k = _shape_key(key)
@@ -1051,10 +990,8 @@ def classify_profile_multi(metrics, shape_thr=None, wave_thr=None):
 def classify_profile(metrics, shape_thr=None, wave_thr=None):
     """互斥单标签分类（v6.5 起为 classify_profile_multi 的兼容包装）。
 
-    驻波(LER/LWR 超阈值且 FFT 周期幅值显著)最高优先，其次六类量值取
-    最大者，否则 Normal。驻波需周期证据（wave_amplitude ≥
-    MORPH_WAVE_AMP_FLOOR_NM）：防止单包络收缩/鼓起等低频形貌因去线性
-    趋势残差偏大被误判为驻波。形状阈值 CD 归一化——生效阈值 =
+    （v7.1.0：驻波分类已移除）六类量值取最大者，否则 Normal。
+    形状阈值 CD 归一化——生效阈值 =
     max(σ自适应阈值, MORPH_SHAPE_CD_RATIO×CD)，CD 取 cd_mode_nm（回退
     cd_mean_nm）。返回 {"label", "label_cn", "margin", "wave",
     "threshold"}；无法评估时 label=None。多标签与星级见
@@ -1117,15 +1054,13 @@ def build_morphology(columns, nm_per_px):
     if _finite_number(noise_sigma) and noise_sigma > 0:
         shape_thr = max(MORPH_SHAPE_FLOOR_NM,
                         min(MORPH_NOISE_K * noise_sigma, MORPH_SHAPE_CAP_NM))
-        wave_thr = max(MORPH_WAVE_FLOOR_NM,
-                       min(MORPH_WAVE_K * noise_sigma, MORPH_WAVE_CAP_NM))
     else:
-        shape_thr, wave_thr = MORPH_SHAPE_FLOOR_NM, MORPH_WAVE_FLOOR_NM
-    thresholds = {"shape": float(shape_thr), "wave": float(wave_thr),
+        shape_thr = MORPH_SHAPE_FLOOR_NM
+    thresholds = {"shape": float(shape_thr),
                   "shape_cd_ratio": float(MORPH_SHAPE_CD_RATIO),
                   "cd_mode": float(global_cd_mode) if global_cd_mode else None}
     for record in per_column:
-        record["classification"] = classify_profile(record["metrics"], shape_thr, wave_thr)
+        record["classification"] = classify_profile(record["metrics"], shape_thr)
     summary = {}
     included = [c for c in per_column if c["included"]]
     shape_keys = {key for key, _ in MORPH_SHAPES}
@@ -1156,7 +1091,7 @@ def build_morphology(columns, nm_per_px):
         metrics["cd_mode_method"] = global_cd_method
     # v6.5：整图分类改多标签+星级；labels 取超阈值量值前二，rating 按主标签
     # 量值相对生效阈值的倍数评定。单标签五字段由 multi 结果保持兼容。
-    classification = classify_profile_multi(metrics, shape_thr, wave_thr)
+    classification = classify_profile_multi(metrics, shape_thr)
     counts = {}
     for record in included:
         label_cn = record["classification"]["label_cn"]
@@ -1173,7 +1108,7 @@ def build_morphology(columns, nm_per_px):
             for record in per_column:
                 value = record["metrics"].get("ler_nm")
                 if _finite_number(value) and value > med + 3.5 * mad:
-                    record.setdefault("flags", []).append("疑似驻波离群")
+                    record.setdefault("flags", []).append("粗糙度显著离群")
     return {"metrics": metrics, "mean_profile_metrics": average_metrics, "summary": summary,
             "mean_profile": profile, "per_column": per_column, "included_count": len(included),
             "excluded_count": len(per_column) - len(included), "nm_per_px": float(nm_per_px),
@@ -1703,7 +1638,7 @@ def write_stats_file(out_txt_path, data, detection_meta=None):
         cd_txt = thresholds.get("cd_mode")
         cd_part = f"；生效阈值=max(形状, {thresholds.get('shape_cd_ratio', 0.1):.0%}×CD={cd_txt:.2f})" if cd_txt else ""
         rows.append(["分类阈值 (nm)",
-                     f"形状≥{thresholds.get('shape', 0):.2f} / 驻波LER·LWR≥{thresholds.get('wave', 0):.2f}（σ_noise={sigma_txt}）{cd_part}"])
+                     f"形状≥{thresholds.get('shape', 0):.2f}（σ_noise={sigma_txt}）{cd_part}"])
     if data.get("scale"):
         sc = data["scale"]
         rows.append(["本图比例尺", f"{sc['pixels']:g} px = {sc['nm']:g} nm；1 px = {sc['nm']/sc['pixels']:.8g} nm"])
