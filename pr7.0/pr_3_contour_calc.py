@@ -282,13 +282,21 @@ def draw_classification_banner(img, label_cn, counts=None, thresholds=None, rati
         (img.shape[0] + strip_h, img.shape[1], 3), (205, 90, 26), dtype=np.uint8)
     extended[strip_h:, :] = img
 
-    def _paint(message):
-        return draw_text_cn(extended, message, (pad, 5), font_size=font_size,
+    def _paint(message, size=None):
+        return draw_text_cn(extended, message, (pad, 5), font_size=size or font_size,
                             color=(255, 255, 255), bold=True)
 
+    # v7.0.1 横幅自适应：文字超宽时先逐步缩小字号，仍超宽才去掉计数后缀，
+    # 保证窄图上分类与星级完整可见（此前直接截断，出现"Norma2"这类残缺）。
+    max_w = extended.shape[1] - 2 * pad
     box = _paint(text)
-    if box is not None and box[2] > extended.shape[1] - 2 * pad:
-        # 横幅超宽（长分类名+计数）：去掉计数后缀重画，保底显示分类+星级。
+    if box is not None and box[2] > max_w:
+        for size in (18, 16, 14, 12, 11):
+            box = _paint(text, size)
+            if box is None or box[2] <= max_w:
+                break
+    if box is not None and box[2] > max_w:
+        # 仍超宽：去掉计数后缀重画，保底显示分类+星级。
         box = _paint(f"Profile: {label_cn}" + (f" {stars}" if stars else ""))
     cv2.line(extended, (0, strip_h - 1), (extended.shape[1] - 1, strip_h - 1),
              (180, 180, 180), 1)

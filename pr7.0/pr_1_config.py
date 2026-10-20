@@ -23,7 +23,7 @@ for _env_name in (
 ):
     os.environ.setdefault(_env_name, "1")
 
-APP_VERSION = "6.5"
+APP_VERSION = "7.0.1"
 APP_TITLE = f"PR profile analyzer v{APP_VERSION}"
 EXE_NAME = f"PR_profile_analyzer_v{APP_VERSION}"
 
