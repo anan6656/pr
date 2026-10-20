@@ -842,8 +842,8 @@ def contour_morphology(y, left, right, valid_left=None, valid_right=None, cd_mod
         # 基准时这类信号幅度过小（0.1nm 级）会漏报。
         # 不把"中段-顶部"对比计入中间粗：SEM 圆头柱顶部天然窄于柱身
         # （A4BY067 2.8nm、A63Q162 系 5nm+），会把正常圆顶柱误报为中间粗。
-        thin_cd = positive_q90((base - width)[middle])
-        thick_cd = positive_q90((width - base)[middle])
+        thin_cd = positive_q90((base - width)[middle]) or 0.0
+        thick_cd = positive_q90((width - base)[middle]) or 0.0
         w_mid = float(np.median(width[middle])) if np.any(middle) else None
         thin_side = 0.0
         if w_mid is not None and np.any(bottom):

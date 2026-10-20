@@ -271,6 +271,23 @@ def _main_row_activity(gray, prefer_upper=True):
     lag = max(8, min(20, int(round(h * 0.03))))
     med_row = np.percentile(residual, 55, axis=1)
     mask_b = residual > med_row[:, None]
+    # v8.0.0 横向亮带惩罚：柱是行内多个分离亮块；顶部/底部横向亮带（电极条、
+    # 信息条、连片亮层）的亮段横跨大半个行宽，不是柱结构。亮段宽度占比 ≥50%
+    # 的行按占比线性压低活动度（最低 0.25），避免主段被亮带抢占
+    # （A671318-01M-2 柱区在图幅下部，顶部亮带曾被误选为柱区）。
+    mx_frac = np.zeros(h, dtype=np.float32)
+    for y in range(h):
+        row = mask_b[y]
+        if not row.any():
+            continue
+        flags = np.concatenate(([0], row.view(np.int8), [0]))
+        edges = np.flatnonzero(np.diff(flags))
+        seg_runs = edges[1::2] - edges[0::2]
+        if seg_runs.size:
+            mx_frac[y] = float(seg_runs.max()) / float(w)
+    band_penalty = np.where(mx_frac < 0.5, 1.0,
+                            np.maximum(0.25, 1.0 - mx_frac)).astype(np.float32)
+    activity = smooth_1d(activity * smooth_1d(band_penalty, 5), max(7, GEOMETRIC_PROFILE_SMOOTH))
     hh = max(1, h - lag)
     inter = np.logical_and(mask_b[:hh], mask_b[lag:]).sum(axis=1).astype(np.float32)
     union = np.logical_or(mask_b[:hh], mask_b[lag:]).sum(axis=1).astype(np.float32)
@@ -2201,13 +2218,13 @@ def _merge_fragment_columns(cols, gray=None, width_ratio=0.45, max_gap=3):
     return cols
 
 
-def _split_wide_columns_by_seam(cols, gray, width_factor=1.7, min_contrast=8.0):
-    """宽柱暗缝拆分（v7.1.0）。
+def _split_wide_columns_by_seam(cols, gray, width_factor=1.5, min_contrast=8.0):
+    """宽柱暗缝拆分（v8.0.0，触发条件 1.5×中位宽）。
 
-    相邻柱粘连时会被追踪成一根宽柱（A671318-01M-2 出现 93~106px 宽柱，
-    而柱群中位约 35px）。宽度 > factor×中位宽的柱，在其 x 区间内沿柱高统计
+    相邻柱粘连时会被追踪成一根宽柱（A671318-01M-2 柱宽呈 60~64 与 36~47
+    双峰交替，宽柱实为两根粘连）。宽度 > factor×中位宽的柱，在其 x 区间内沿柱高统计
     列中位灰度，寻找纵向暗缝（两侧为柱体、缝内明显变暗且缝宽 2~10px），
-    在缝中心把柱一分为二。找不到可靠暗缝则保持原样。
+    在缝中心把柱一分为二。找不到可靠暗缝则保持原样（单柱不会被误拆）。
     """
     if gray is None or len(cols) < 2:
         return cols

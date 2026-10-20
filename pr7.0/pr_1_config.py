@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""PR profile analyzer v7.5.0 — 公共配置模块。
+"""PR profile analyzer v8.0.0 — 公共配置模块。
 
 集中管理全局常量、形貌指标定义、帮助文本与每图比例尺读写。
 所有其他模块（识别、计算、对比、GUI、主入口）统一从本模块读取配置；
@@ -23,7 +23,7 @@ for _env_name in (
 ):
     os.environ.setdefault(_env_name, "1")
 
-APP_VERSION = "7.5.0"
+APP_VERSION = "8.0.0"
 APP_TITLE = f"PR profile analyzer v{APP_VERSION}"
 EXE_NAME = f"PR_profile_analyzer_v{APP_VERSION}"
 
@@ -310,6 +310,9 @@ v7.1.0 起不再计算周期起伏（幅值/周期）与驻波分类：该量由
 形貌与噪声影响大，不作为形貌判据；粗糙度只保留 LER/LWR 3σ。
 形貌出现数量以量值≥形状阈值计数（JSON 字段沿用 above_1nm 旧名），仅作统一统计阈值；所有原始数值（含 0）均导出。
 检测触及图像/ROI 边界的残柱仍显示逐柱值和截断提示，但不参与平均形貌 baseline；无完整柱时禁止比较。
+识别层（v8.0.0）：主体带选择加入"横向亮带惩罚"——亮段横跨 ≥50% 行宽的行（电极条、
+信息条、连片亮层）活动度按占比线性压低（最低 0.25），防止主段被亮带抢占；
+粘连宽柱暗缝拆分触发条件 1.5×中位宽，找不到可靠暗缝不拆（单柱不误拆）。
 比例尺来自用户输入，跨图比较可分别设置 nm/px；滤波、像素尺寸和测量长度会影响粗糙度，结果未作噪声去偏。
 Δ=样本-baseline；百分比=Δ/abs(baseline)*100；baseline 为 0 时百分比留空，不显示无穷大。
 """
@@ -404,7 +407,7 @@ def save_image_scale(image_path, scale):
 # =====================================================================
 
 FORMULA_HELP = """## 1  符号、范围与单位
-本文描述 v7.5.0 实际实现。几何分区为程序定义的工程指标，各项可以同时出现。
+本文描述 v8.0.0 实际实现。几何分区为程序定义的工程指标，各项可以同时出现。
 灰度、binary、坐标三个量分开使用；尺寸来自坐标，不直接由灰度值换算。
 
 第 i 行轮廓为 (y_i, L_i, R_i)，i=0…N−1；y 从顶部向底部增加，L/R 为左右 x 坐标（px）。
@@ -775,7 +778,7 @@ Line CD 与统计 CD 均按左右边界距离输出。
 """
 
 
-ABOUT_HELP = """PR profile analyzer v7.5.0
+ABOUT_HELP = """PR profile analyzer v8.0.0
 原作者：E924744 Kang An
 
 binary 粗轮廓 + 有符号 Scharr + 动态规划 + 亚像素定位。
